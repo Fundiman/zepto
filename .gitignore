@@ -1,0 +1,32 @@
+# --- Build artifacts ---
+*.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.dll
+*.so
+*.dylib
+*.exp
+
+# --- Build directories ---
+build/
+cmake-build-*/
+
+# --- IDE / editor ---
+.vs/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS noise ---
+.DS_Store
+Thumbs.db
+
+# --- Test data (all generated at runtime) ---
+*.zepto
+__pycache__/
+zepto/
+uhhhrandomcrap.txt
