@@ -212,8 +212,27 @@ public:
 private:
     struct Condition {
         size_t col = 0;
-        std::string op;
+        std::string op;        // "=" "!=" "<>" "<" ">" "<=" ">=" "LIKE" "IS NULL" "IS NOT NULL" "IN" "NOT IN"
         Value val;
+        std::vector<Value> val_list; // for IN/NOT IN
+        bool not_like = false; // NOT LIKE
+    };
+
+    // An OR-group: the row matches if ANY ConditionGroup is fully satisfied
+    using ConditionGroup = std::vector<Condition>;
+    using WhereClause = std::vector<ConditionGroup>;
+
+    // SELECT helpers
+    enum class AggFunc : uint8_t { NONE, COUNT, SUM, AVG, MIN, MAX };
+    struct SelectCol {
+        size_t col = 0;
+        bool is_star = false;
+        AggFunc agg = AggFunc::NONE;
+        bool distinct = false;
+    };
+    struct OrderByItem {
+        size_t col = 0;
+        bool asc = true;
     };
 
     // WAL
@@ -229,6 +248,8 @@ private:
     // query helpers
     size_t resolve_col(const std::string& name) const;
     bool eval(const Row& row, const Condition& c) const;
+    bool eval_where(const Row& row, const WhereClause& wc) const;
+    bool like_match(const std::string& s, const std::string& pat) const;
 
     // SQL parsing
     std::vector<std::string> tokenize(const std::string& sql);
@@ -238,9 +259,11 @@ private:
     void exec_update(const std::vector<std::string>& tok, size_t& pos);
     void exec_delete(const std::vector<std::string>& tok, size_t& pos);
     void exec_create(const std::vector<std::string>& tok, size_t& pos);
+    void exec_drop(const std::vector<std::string>& tok, size_t& pos);
+    void exec_alter(const std::vector<std::string>& tok, size_t& pos);
 
     Value parse_value(const std::string& s);
-    std::vector<Condition> parse_where(const std::vector<std::string>& tok, size_t& pos);
+    WhereClause parse_where(const std::vector<std::string>& tok, size_t& pos);
 
     // state
     std::string dir_;

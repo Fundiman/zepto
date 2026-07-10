@@ -8,6 +8,8 @@
 #include <sstream>
 #include <cctype>
 #include <filesystem>
+#include <set>
+#include <map>
 namespace fs = std::filesystem;
 
 namespace zepto {
@@ -1440,15 +1442,67 @@ bool Database::recover() {
     return true;
 }
 
+static Encoding pick_best_encoding(const std::vector<Value>& col_data, ColumnType type) {
+    if (col_data.empty()) return Encoding::PLAIN;
+    if (type == ColumnType::STRING) {
+        // DICT if few unique values
+        std::set<std::string> uniq;
+        for (auto& v : col_data) {
+            if (auto* s = std::get_if<std::string>(&v)) {
+                uniq.insert(*s);
+                if (uniq.size() > col_data.size() / 4) return Encoding::PLAIN; // too many unique
+            }
+        }
+        return uniq.size() <= 1 ? Encoding::PLAIN : Encoding::DICT;
+    }
+    if (type == ColumnType::I32 || type == ColumnType::I64) {
+        // BIT_PACKED if range is small
+        int64_t lo = INT64_MAX, hi = INT64_MIN;
+        int nulls = 0;
+        for (auto& v : col_data) {
+            if (is_null(v)) { nulls++; continue; }
+            int64_t x = 0;
+            if (auto* p = std::get_if<int32_t>(&v)) x = *p;
+            else if (auto* p = std::get_if<int64_t>(&v)) x = *p;
+            else continue;
+            if (x < lo) lo = x;
+            if (x > hi) hi = x;
+        }
+        uint64_t range = (uint64_t)(hi - lo);
+        int bits = 0;
+        if (range > 0) bits = (int)std::bit_width(range);
+        // BIT_PACKED saves space if bits <= 24 (3 bytes vs 4/8)
+        size_t non_null = col_data.size() - nulls;
+        if (bits > 0 && bits <= 24 && non_null > 0) return Encoding::BIT_PACKED;
+    }
+    return Encoding::PLAIN;
+}
+
 bool Database::checkpoint() {
     if (!dirty_ && schema_.empty()) return true;
+
+    // Auto-select best encodings
+    std::vector<Encoding> best_encs(schema_.size());
+    for (size_t ci = 0; ci < schema_.size(); ci++) {
+        if (schema_[ci].encoding == Encoding::PLAIN) {
+            // Only auto-select if user didn't explicitly set
+            std::vector<Value> col_data;
+            col_data.reserve(rows_.size());
+            for (auto& row : rows_) {
+                col_data.push_back(ci < row.columns.size() ? row.columns[ci] : Value{});
+            }
+            best_encs[ci] = pick_best_encoding(col_data, schema_[ci].type);
+        } else {
+            best_encs[ci] = schema_[ci].encoding;
+        }
+    }
 
     std::string tmp = current_path_ + ".tmp";
 
     {
         Writer wtr(tmp);
-        for (auto& cm : schema_) {
-            wtr.add_column(cm.name, cm.type, cm.nullable, cm.encoding);
+        for (size_t ci = 0; ci < schema_.size(); ci++) {
+            wtr.add_column(schema_[ci].name, schema_[ci].type, schema_[ci].nullable, best_encs[ci]);
         }
         for (auto& row : rows_) {
             wtr.append_row(row.columns);
@@ -1572,6 +1626,32 @@ std::vector<std::string> Database::tokenize(const std::string& sql) {
         cur += c;
     }
     if (!cur.empty()) tok.push_back(std::move(cur));
+
+    // Merge multi-word keywords (2-token)
+    for (size_t i = 0; i + 1 < tok.size();) {
+        auto up = [&](const std::string& s) { return to_upper(s); };
+        if ((up(tok[i]) == "NOT" && up(tok[i+1]) == "LIKE") ||
+            (up(tok[i]) == "ORDER" && up(tok[i+1]) == "BY") ||
+            (up(tok[i]) == "GROUP" && up(tok[i+1]) == "BY") ||
+            (up(tok[i]) == "IS" && up(tok[i+1]) == "NULL") ||
+            (up(tok[i]) == "NOT" && up(tok[i+1]) == "IN")) {
+            tok[i] = tok[i] + " " + tok[i+1];
+            tok.erase(tok.begin() + i + 1);
+        } else {
+            i++;
+        }
+    }
+    // Merge 3-token: IS NOT NULL
+    for (size_t i = 0; i + 2 < tok.size();) {
+        auto up = [&](const std::string& s) { return to_upper(s); };
+        if (up(tok[i]) == "IS" && up(tok[i+1]) == "NOT" && up(tok[i+2]) == "NULL") {
+            tok[i] = "IS NOT NULL";
+            tok.erase(tok.begin() + i + 1);
+            tok.erase(tok.begin() + i + 1);
+        } else {
+            i++;
+        }
+    }
     return tok;
 }
 
@@ -1592,24 +1672,87 @@ Value Database::parse_value(const std::string& s) {
     return s;
 }
 
-std::vector<Database::Condition> Database::parse_where(const std::vector<std::string>& tok, size_t& pos) {
-    std::vector<Condition> conds;
+Database::WhereClause Database::parse_where(const std::vector<std::string>& tok, size_t& pos) {
+    WhereClause result;
+    ConditionGroup current;
     while (pos < tok.size()) {
         std::string col = tok[pos++];
         if (pos >= tok.size()) break;
-        std::string op = tok[pos++];
-        if (pos >= tok.size()) break;
-        Value val = parse_value(tok[pos++]);
-        size_t ci = resolve_col(col);
-        Condition c;
-        c.col = ci;
-        c.op = op;
-        c.val = val;
-        conds.push_back(c);
-        if (pos < tok.size() && to_upper(tok[pos]) == "AND") { pos++; continue; }
+        std::string op_raw = tok[pos++];
+        std::string op = to_upper(op_raw);
+
+        bool handled = true;
+
+        if (op == "IS NULL") {
+            Condition c;
+            c.col = resolve_col(col);
+            c.op = "IS NULL";
+            current.push_back(c);
+        } else if (op == "IS NOT NULL") {
+            Condition c;
+            c.col = resolve_col(col);
+            c.op = "IS NOT NULL";
+            current.push_back(c);
+        } else if (op == "IN" || op == "NOT IN") {
+            if (pos >= tok.size() || tok[pos] != "(") break;
+            pos++;
+            Condition c;
+            c.col = resolve_col(col);
+            c.op = op;
+            while (pos < tok.size() && tok[pos] != ")") {
+                c.val_list.push_back(parse_value(tok[pos++]));
+                if (pos < tok.size() && tok[pos] == ",") pos++;
+            }
+            if (pos < tok.size() && tok[pos] == ")") pos++;
+            current.push_back(c);
+        } else if (op == "BETWEEN") {
+            if (pos >= tok.size()) break;
+            Value lo = parse_value(tok[pos++]);
+            if (pos >= tok.size() || to_upper(tok[pos]) != "AND") break;
+            pos++;
+            if (pos >= tok.size()) break;
+            Value hi = parse_value(tok[pos++]);
+            Condition c1, c2;
+            c1.col = resolve_col(col); c1.op = ">="; c1.val = lo;
+            c2.col = resolve_col(col); c2.op = "<="; c2.val = hi;
+            current.push_back(c1);
+            current.push_back(c2);
+        } else {
+            // Standard: op val
+            if (pos >= tok.size()) break;
+            handled = false;
+            bool not_like = false;
+            if (op == "NOT LIKE") {
+                not_like = true;
+                op = "LIKE";
+            }
+            {
+                Value val = parse_value(tok[pos++]);
+                Condition c;
+                c.col = resolve_col(col);
+                c.op = op;
+                c.val = val;
+                c.not_like = not_like;
+                current.push_back(c);
+            }
+        }
+        if (!handled && pos >= tok.size()) break;
+
+        if (pos < tok.size()) {
+            std::string kw = to_upper(tok[pos]);
+            if (kw == "AND") { pos++; continue; }
+            if (kw == "OR") {
+                pos++;
+                result.push_back(std::move(current));
+                current.clear();
+                continue;
+            }
+        }
         break;
     }
-    return conds;
+    if (!current.empty()) result.push_back(std::move(current));
+    if (result.empty()) result.push_back({});
+    return result;
 }
 
 size_t Database::resolve_col(const std::string& name) const {
@@ -1618,9 +1761,43 @@ size_t Database::resolve_col(const std::string& name) const {
     return (size_t)-1;
 }
 
+bool Database::like_match(const std::string& s, const std::string& pat) const {
+    size_t si = 0, pi = 0, star_si = (size_t)-1, star_pi = (size_t)-1;
+    while (si < s.size()) {
+        if (pi < pat.size() && (pat[pi] == s[si] || pat[pi] == '_')) { si++; pi++; }
+        else if (pi < pat.size() && pat[pi] == '%') { star_si = si; star_pi = pi++; }
+        else if (star_pi != (size_t)-1) { si = ++star_si; pi = star_pi + 1; }
+        else return false;
+    }
+    while (pi < pat.size() && pat[pi] == '%') pi++;
+    return pi == pat.size();
+}
+
 bool Database::eval(const Row& row, const Condition& c) const {
     if (c.col >= row.columns.size()) return false;
     auto& val = row.columns[c.col];
+
+    if (c.op == "IS NULL") return is_null(val);
+    if (c.op == "IS NOT NULL") return !is_null(val);
+
+    if (c.op == "IN" || c.op == "NOT IN") {
+        if (is_null(val)) return false;
+        bool found = false;
+        for (auto& v : c.val_list) {
+            if (val == v) { found = true; break; }
+        }
+        return c.op == "IN" ? found : !found;
+    }
+
+    if (c.op == "LIKE") {
+        if (is_null(val)) return false;
+        auto* s = std::get_if<std::string>(&val);
+        auto* p = std::get_if<std::string>(&c.val);
+        if (!s || !p) return false;
+        bool m = like_match(*s, *p);
+        return c.not_like ? !m : m;
+    }
+
     if (is_null(val)) return c.op == "!=" || c.op == "<>";
     auto cmp = [&](auto a, auto b) -> bool {
         if (c.op == "=") return a == b;
@@ -1663,6 +1840,18 @@ bool Database::eval(const Row& row, const Condition& c) const {
     return ok;
 }
 
+bool Database::eval_where(const Row& row, const WhereClause& wc) const {
+    if (wc.empty()) return true;
+    for (auto& group : wc) {
+        bool all_match = true;
+        for (auto& c : group) {
+            if (!eval(row, c)) { all_match = false; break; }
+        }
+        if (all_match) return true;
+    }
+    return false;
+}
+
 bool Database::exec(const std::string& sql) {
     if (!opened_) return false;
     auto tok = tokenize(sql);
@@ -1675,6 +1864,8 @@ bool Database::exec(const std::string& sql) {
     if (cmd == "SELECT") { size_t p = 1; exec_select(tok, p); return true; }
     if (cmd == "UPDATE") { size_t p = 1; exec_update(tok, p); return true; }
     if (cmd == "DELETE") { size_t p = 1; exec_delete(tok, p); return true; }
+    if (cmd == "DROP") { size_t p = 1; exec_drop(tok, p); return true; }
+    if (cmd == "ALTER") { size_t p = 1; exec_alter(tok, p); return true; }
     if (cmd == "BEGIN" || cmd == "START") {
         std::cout << "  (transactions not fully implemented, executing directly)\n";
         return true;
@@ -1717,20 +1908,57 @@ bool Database::exec(const std::string& sql) {
         }
         if (cmd == ".HELP") {
             std::cout << "  Commands:\n";
-            std::cout << "    CREATE TABLE <name> (<col> <type>, ...)\n";
+            std::cout << "    CREATE TABLE <name> (<col> <type> [NOT NULL] [DICT|BIT_PACKED], ...)\n";
             std::cout << "    INSERT INTO <name> VALUES (<val>, ...)\n";
-            std::cout << "    SELECT *|<cols> FROM <name> [WHERE <cond> [AND ...]] [LIMIT n] [OFFSET n]\n";
+            std::cout << "    SELECT [DISTINCT] *|<cols>|<agg>(<col>) FROM <name>\n";
+            std::cout << "      [WHERE <cond> [AND|OR ...]] [GROUP BY <col>] [ORDER BY <col> [ASC|DESC]]\n";
+            std::cout << "      [HAVING <cond>] [LIMIT n] [OFFSET n]\n";
             std::cout << "    UPDATE <name> SET <col>=<val>,... WHERE <cond>\n";
             std::cout << "    DELETE FROM <name> WHERE <cond>\n";
+            std::cout << "    DROP TABLE <name>\n";
+            std::cout << "    ALTER TABLE <name> ADD COLUMN <col> <type> [NOT NULL] [DICT|BIT_PACKED]\n";
+            std::cout << "    ALTER TABLE <name> DROP COLUMN <col>\n";
             std::cout << "    BEGIN | COMMIT | ROLLBACK\n";
+            std::cout << "    WHERE operators: = != <> < > <= >= LIKE NOT LIKE IS NULL IS NOT NULL IN NOT IN BETWEEN\n";
+            std::cout << "    Scalar functions: UPPER(col) LOWER(col) LENGTH(col)\n";
+            std::cout << "    Column aliases: col AS alias\n";
             std::cout << "    .checkpoint\n";
             std::cout << "    .snapshot <name>\n";
             std::cout << "    .snapshots\n";
             std::cout << "    .restore <name>\n";
+            std::cout << "    .tables\n";
+            std::cout << "    .schema\n";
             std::cout << "    .exit | .quit\n";
             return true;
         }
-        if (cmd == ".EXIT" || cmd == ".QUIT") return false; // signal to exit
+        if (cmd == ".TABLES") {
+            if (schema_.empty()) std::cout << "  no tables\n";
+            else std::cout << "  " << (!dir_.empty() ? fs::path(dir_).filename().string() : "zepto") << "\n";
+            return true;
+        }
+        if (cmd == ".SCHEMA") {
+            if (schema_.empty()) { std::cout << "  no table\n"; return true; }
+            std::cout << "  CREATE TABLE x (\n";
+            for (size_t i = 0; i < schema_.size(); i++) {
+                auto& cm = schema_[i];
+                const char* tn = "UNKNOWN";
+                switch (cm.type) {
+                    case ColumnType::I32: tn = "I32"; break;
+                    case ColumnType::I64: tn = "I64"; break;
+                    case ColumnType::F32: tn = "F32"; break;
+                    case ColumnType::F64: tn = "F64"; break;
+                    case ColumnType::STRING: tn = "STRING"; break;
+                }
+                std::cout << "    " << cm.name << " " << tn;
+                if (!cm.nullable) std::cout << " NOT NULL";
+                if (cm.encoding == Encoding::DICT) std::cout << " DICT";
+                else if (cm.encoding == Encoding::BIT_PACKED) std::cout << " BIT_PACKED";
+                std::cout << (i + 1 < schema_.size() ? "," : "") << "\n";
+            }
+            std::cout << "  )\n";
+            return true;
+        }
+        if (cmd == ".EXIT" || cmd == ".QUIT") return false;
         std::cout << "  unknown command: " << sql << "\n";
         return true;
     }
@@ -1741,12 +1969,11 @@ bool Database::exec(const std::string& sql) {
 
 void Database::exec_create(const std::vector<std::string>& tok, size_t& pos) {
     if (!schema_.empty()) { std::cout << "  table already exists\n"; return; }
-    // CREATE TABLE name (col TYPE, ...)
     if (pos >= tok.size() || to_upper(tok[pos]) != "TABLE") { std::cout << "  syntax: CREATE TABLE name (...)\n"; return; }
     pos++;
-    std::string table_name = tok[pos++]; // ignored, single table
-    if (pos >= tok.size() || tok[pos] != "(") { std::cout << "  expected '('\n"; return; }
-    pos++; // skip (
+    pos++; // table name (ignored, single table)
+    if (pos >= tok.size() || tok[pos] != "(") { std::cout << "  expected '(\n"; return; }
+    pos++;
 
     while (pos < tok.size() && tok[pos] != ")") {
         std::string col = tok[pos++];
@@ -1760,17 +1987,58 @@ void Database::exec_create(const std::vector<std::string>& tok, size_t& pos) {
         else if (type_str == "STRING" || type_str == "TEXT" || type_str == "VARCHAR") ct = ColumnType::STRING;
         else { std::cout << "  unknown type: " << type_str << "\n"; return; }
 
+        bool nullable = true;
+        Encoding enc = Encoding::PLAIN;
+
+        while (pos < tok.size() && tok[pos] != "," && tok[pos] != ")") {
+            std::string kw = to_upper(tok[pos]);
+            if (kw == "NOT" && pos + 1 < tok.size() && to_upper(tok[pos+1]) == "NULL") {
+                nullable = false; pos += 2;
+            } else if (kw == "NULL" || kw == "NULLABLE") {
+                nullable = true; pos++;
+            } else if (kw == "DICT") {
+                enc = Encoding::DICT; pos++;
+            } else if (kw == "BIT_PACKED") {
+                enc = Encoding::BIT_PACKED; pos++;
+            } else if (kw == "PLAIN") {
+                enc = Encoding::PLAIN; pos++;
+            } else break;
+        }
+
         ColMeta cm;
         cm.name = col;
         cm.type = ct;
-        cm.nullable = true;
-        cm.encoding = Encoding::PLAIN;
+        cm.nullable = nullable;
+        cm.encoding = enc;
         schema_.push_back(cm);
 
         if (pos < tok.size() && tok[pos] == ",") pos++;
     }
     if (pos < tok.size() && tok[pos] == ")") pos++;
     std::cout << "  table created (" << schema_.size() << " columns)\n";
+}
+
+
+static Value coerce_value(const Value& v, ColumnType target) {
+    if (is_null(v)) return v;
+    return std::visit([&](auto&& x) -> Value {
+        using T = std::decay_t<decltype(x)>;
+        if constexpr (std::is_same_v<T, std::string>) {
+            if (target == ColumnType::STRING) return x;
+            return x;
+        } else if constexpr (std::is_arithmetic_v<T>) {
+            double d = (double)x;
+            switch (target) {
+                case ColumnType::I32: return (int32_t)d;
+                case ColumnType::I64: return (int64_t)d;
+                case ColumnType::F32: return (float)d;
+                case ColumnType::F64: return d;
+                default: return x;
+            }
+        } else {
+            return x;
+        }
+    }, v);
 }
 
 void Database::exec_insert(const std::vector<std::string>& tok, size_t& pos) {
@@ -1793,6 +2061,8 @@ void Database::exec_insert(const std::vector<std::string>& tok, size_t& pos) {
 
     if (vals.size() != schema_.size()) { std::cout << "  wrong number of values\n"; return; }
 
+    for (size_t i = 0; i < vals.size(); i++) vals[i] = coerce_value(vals[i], schema_[i].type);
+
     Row r;
     r.columns = vals;
     auto bytes = row_to_bytes(r);
@@ -1806,27 +2076,183 @@ void Database::exec_insert(const std::vector<std::string>& tok, size_t& pos) {
 void Database::exec_select(const std::vector<std::string>& tok, size_t& pos) {
     if (schema_.empty()) { std::cout << "  no table\n"; return; }
 
-    std::vector<size_t> cols;
-    if (pos < tok.size() && tok[pos] == "*") {
-        pos++;
-        for (size_t i = 0; i < schema_.size(); i++) cols.push_back(i);
-    } else {
-        while (pos < tok.size() && to_upper(tok[pos]) != "FROM") {
+    // Parse DISTINCT
+    bool distinct = false;
+    if (pos < tok.size() && to_upper(tok[pos]) == "DISTINCT") { distinct = true; pos++; }
+
+    // Parse select columns (may include aggregate functions)
+    enum class ScalarFunc : uint8_t { NONE, UPPER, LOWER, LENGTH };
+    struct SCol {
+        size_t col = 0;
+        bool is_star = false;
+        AggFunc agg = AggFunc::NONE;
+        ScalarFunc func = ScalarFunc::NONE;
+        std::string alias;
+    };
+    std::vector<SCol> sel_cols;
+    bool has_aggregates = false;
+
+    auto parse_sel_col = [&]() -> bool {
+        if (pos >= tok.size()) return false;
+        std::string up = to_upper(tok[pos]);
+        AggFunc af = AggFunc::NONE;
+        ScalarFunc sf = ScalarFunc::NONE;
+
+        // Check for aggregate functions
+        if (up == "COUNT" || up == "SUM" || up == "AVG" || up == "MIN" || up == "MAX") {
+            if (up == "COUNT") af = AggFunc::COUNT;
+            else if (up == "SUM") af = AggFunc::SUM;
+            else if (up == "AVG") af = AggFunc::AVG;
+            else if (up == "MIN") af = AggFunc::MIN;
+            else if (up == "MAX") af = AggFunc::MAX;
+            pos++;
+            if (pos >= tok.size() || tok[pos] != "(") return false;
+            pos++;
+            bool agg_distinct = false;
+            if (pos < tok.size() && to_upper(tok[pos]) == "DISTINCT") { agg_distinct = true; pos++; }
+            if (pos >= tok.size()) return false;
+            if (tok[pos] == "*") {
+                if (af != AggFunc::COUNT) return false; // SUM(*) etc invalid
+                pos++;
+                // Push a dummy column for COUNT(*)
+                SCol sc; sc.col = 0; sc.agg = af; sc.is_star = true;
+                sel_cols.push_back(sc);
+            } else {
+                std::string cn = tok[pos++];
+                size_t ci = resolve_col(cn);
+                if (ci == (size_t)-1) return false;
+                SCol sc;
+                sc.col = ci; sc.agg = af; sc.is_star = false;
+                sel_cols.push_back(sc);
+            }
+            if (pos >= tok.size() || tok[pos] != ")") return false;
+            pos++;
+            has_aggregates = true;
+            // optional AS alias
+            if (pos < tok.size() && to_upper(tok[pos]) == "AS") { pos++; if (pos < tok.size()) sel_cols.back().alias = tok[pos++]; }
+            return true;
+        }
+        // Check for scalar functions: UPPER, LOWER, LENGTH
+        if ((up == "UPPER" || up == "LOWER" || up == "LENGTH") &&
+            pos + 1 < tok.size() && tok[pos+1] == "(") {
+            if (up == "UPPER") sf = ScalarFunc::UPPER;
+            else if (up == "LOWER") sf = ScalarFunc::LOWER;
+            else if (up == "LENGTH") sf = ScalarFunc::LENGTH;
+            pos++;
+            pos++; // (
+            if (pos >= tok.size()) return false;
             std::string cn = tok[pos++];
             size_t ci = resolve_col(cn);
-            if (ci == (size_t)-1) { std::cout << "  unknown column: " << cn << "\n"; return; }
-            cols.push_back(ci);
-            if (pos < tok.size() && tok[pos] == ",") pos++;
+            if (ci == (size_t)-1) return false;
+            if (pos >= tok.size() || tok[pos] != ")") return false;
+            pos++;
+            SCol sc;
+            sc.col = ci; sc.func = sf; sc.is_star = false;
+            sel_cols.push_back(sc);
+            // optional AS alias
+            if (pos < tok.size() && to_upper(tok[pos]) == "AS") { pos++; if (pos < tok.size()) sel_cols.back().alias = tok[pos++]; }
+            return true;
         }
+        // Regular column or *
+        if (tok[pos] == "*") {
+            pos++;
+            SCol sc; sc.is_star = true; sc.agg = AggFunc::NONE;
+            sel_cols.push_back(sc);
+        } else {
+            std::string cn = tok[pos++];
+            size_t ci = resolve_col(cn);
+            if (ci == (size_t)-1) return false;
+            SCol sc; sc.col = ci; sc.agg = AggFunc::NONE; sc.is_star = false;
+            sel_cols.push_back(sc);
+            // optional AS alias
+            if (pos < tok.size() && to_upper(tok[pos]) == "AS") { pos++; if (pos < tok.size()) sel_cols.back().alias = tok[pos++]; }
+        }
+        return true;
+    };
+
+    while (pos < tok.size() && to_upper(tok[pos]) != "FROM") {
+        if (!parse_sel_col()) { std::cout << "  syntax error in SELECT\n"; return; }
+        if (pos < tok.size() && tok[pos] == ",") pos++;
     }
 
     if (pos >= tok.size() || to_upper(tok[pos]) != "FROM") { std::cout << "  expected FROM\n"; return; }
     pos++;
     pos++; // table name
 
-    std::vector<Condition> conds;
-    if (pos < tok.size() && to_upper(tok[pos]) == "WHERE") { pos++; conds = parse_where(tok, pos); }
+    // Expand * before WHERE (COUNT(*) stays as a single column)
+    std::vector<SCol> expanded;
+    for (auto& sc : sel_cols) {
+        if (sc.is_star && sc.agg == AggFunc::NONE) {
+            for (size_t i = 0; i < schema_.size(); i++) {
+                SCol e; e.col = i; e.agg = sc.agg;
+                expanded.push_back(e);
+            }
+        } else expanded.push_back(sc);
+    }
+    sel_cols.swap(expanded);
 
+    auto apply_scalar = [](ScalarFunc func, const Value& val) -> Value {
+        if (func == ScalarFunc::NONE || is_null(val)) return val;
+        auto* s = std::get_if<std::string>(&val);
+        if (!s) return val;
+        std::string r = *s;
+        switch (func) {
+            case ScalarFunc::UPPER: for (auto& c : r) c = (char)std::toupper((unsigned char)c); return r;
+            case ScalarFunc::LOWER: for (auto& c : r) c = (char)std::tolower((unsigned char)c); return r;
+            case ScalarFunc::LENGTH: return (int64_t)r.size();
+            default: return val;
+        }
+    };
+
+    // WHERE
+    WhereClause wc;
+    if (pos < tok.size() && to_upper(tok[pos]) == "WHERE") { pos++; wc = parse_where(tok, pos); }
+
+    // Helper to resolve column name, optionally checking sel_col aliases
+    auto resolve_col_or_alias = [&](const std::string& cn) -> size_t {
+        size_t ci = resolve_col(cn);
+        if (ci != (size_t)-1) return ci;
+        for (auto& sc : sel_cols) {
+            if (sc.alias == cn) return sc.col;
+        }
+        return (size_t)-1;
+    };
+
+    // GROUP BY
+    std::vector<size_t> group_cols;
+    if (pos < tok.size() && to_upper(tok[pos]) == "GROUP BY") {
+        pos++;
+        while (pos < tok.size() && to_upper(tok[pos]) != "HAVING" && to_upper(tok[pos]) != "ORDER BY" && to_upper(tok[pos]) != "LIMIT" && to_upper(tok[pos]) != "OFFSET" && tok[pos] != ";") {
+            std::string cn = tok[pos++];
+            size_t ci = resolve_col_or_alias(cn);
+            if (ci == (size_t)-1) { std::cout << "  unknown column: " << cn << "\n"; return; }
+            group_cols.push_back(ci);
+            if (pos < tok.size() && tok[pos] == ",") pos++;
+        }
+    }
+
+    // HAVING (parse as AND-only for simplicity)
+    WhereClause having_wc;
+    if (pos < tok.size() && to_upper(tok[pos]) == "HAVING") { pos++; having_wc = parse_where(tok, pos); }
+
+    // ORDER BY
+    std::vector<OrderByItem> order_by;
+    if (pos < tok.size() && to_upper(tok[pos]) == "ORDER BY") {
+        pos++;
+        while (pos < tok.size() && to_upper(tok[pos]) != "LIMIT" && to_upper(tok[pos]) != "OFFSET" && tok[pos] != ";") {
+            std::string cn = tok[pos++];
+            size_t ci = resolve_col_or_alias(cn);
+            if (ci == (size_t)-1) { std::cout << "  unknown column: " << cn << "\n"; return; }
+            bool asc = true;
+            if (pos < tok.size() && to_upper(tok[pos]) == "ASC") { asc = true; pos++; }
+            else if (pos < tok.size() && to_upper(tok[pos]) == "DESC") { asc = false; pos++; }
+            OrderByItem ob; ob.col = ci; ob.asc = asc;
+            order_by.push_back(ob);
+            if (pos < tok.size() && tok[pos] == ",") pos++;
+        }
+    }
+
+    // LIMIT / OFFSET
     size_t limit = 0, offset = 0;
     if (pos < tok.size() && to_upper(tok[pos]) == "LIMIT") {
         pos++;
@@ -1837,30 +2263,255 @@ void Database::exec_select(const std::vector<std::string>& tok, size_t& pos) {
         if (pos < tok.size()) offset = (size_t)std::stoll(tok[pos++]);
     }
 
+    // Filter rows
+    std::vector<size_t> filtered_idx;
+    filtered_idx.reserve(rows_.size());
+    for (size_t ri = 0; ri < rows_.size(); ri++) {
+        if (eval_where(rows_[ri], wc)) filtered_idx.push_back(ri);
+    }
+
+    // --- Aggregates / GROUP BY ---
+    if (has_aggregates || !group_cols.empty()) {
+        struct AggState {
+            int64_t count = 0;
+            double sum = 0;
+            double min_val = 0;
+            double max_val = 0;
+            bool has_min = false;
+            bool has_max = false;
+        };
+        std::map<std::vector<Value>, AggState> groups;
+        std::vector<std::vector<Value>> group_order;
+
+        for (auto ri : filtered_idx) {
+            auto& row = rows_[ri];
+            std::vector<Value> gkey;
+            if (!group_cols.empty()) {
+                for (auto gc : group_cols) {
+                    gkey.push_back(gc < row.columns.size() ? row.columns[gc] : Value{});
+                }
+            } else {
+                gkey = {Value{}}; // single global group
+            }
+
+            auto it = groups.find(gkey);
+            if (it == groups.end()) {
+                group_order.push_back(gkey);
+                it = groups.insert({gkey, AggState{}}).first;
+            }
+            auto& st = it->second;
+            st.count++;
+
+            for (auto& sc : sel_cols) {
+                if (sc.agg == AggFunc::NONE) continue;
+                double v = 0;
+                if (sc.col < row.columns.size()) {
+                    auto& cv = row.columns[sc.col];
+                    std::visit([&](auto&& x) {
+                        using T = std::decay_t<decltype(x)>;
+                        if constexpr (!std::is_same_v<T, std::monostate> && !std::is_same_v<T, std::string>)
+                            v = (double)x;
+                    }, cv);
+                }
+                if (sc.agg == AggFunc::SUM || sc.agg == AggFunc::AVG) st.sum += v;
+                if (sc.agg == AggFunc::MIN && (!st.has_min || v < st.min_val)) { st.min_val = v; st.has_min = true; }
+                if (sc.agg == AggFunc::MAX && (!st.has_max || v > st.max_val)) { st.max_val = v; st.has_max = true; }
+            }
+        }
+
+        // Print header
+        for (size_t i = 0; i < sel_cols.size(); i++) {
+            if (i > 0) std::cout << " | ";
+            auto& sc = sel_cols[i];
+            if (!sc.alias.empty()) {
+                std::cout << sc.alias;
+            } else if (sc.agg != AggFunc::NONE) {
+                const char* an = "AGG";
+                switch (sc.agg) {
+                    case AggFunc::COUNT: an = "COUNT"; break;
+                    case AggFunc::SUM:   an = "SUM";   break;
+                    case AggFunc::AVG:   an = "AVG";   break;
+                    case AggFunc::MIN:   an = "MIN";   break;
+                    case AggFunc::MAX:   an = "MAX";   break;
+                    default: break;
+                }
+                if (sc.is_star) std::cout << an << "(*)";
+                else std::cout << an << "(" << schema_[sc.col].name << ")";
+            } else if (sc.func != ScalarFunc::NONE) {
+                const char* fn = "FN";
+                switch (sc.func) {
+                    case ScalarFunc::UPPER: fn = "UPPER"; break;
+                    case ScalarFunc::LOWER: fn = "LOWER"; break;
+                    case ScalarFunc::LENGTH: fn = "LENGTH"; break;
+                    default: break;
+                }
+                std::cout << fn << "(" << schema_[sc.col].name << ")";
+            } else {
+                std::cout << schema_[sc.col].name;
+            }
+        }
+        std::cout << "\n---\n";
+
+        size_t printed = 0;
+        for (auto& gk : group_order) {
+            if (limit > 0 && printed >= limit + offset) break;
+            auto& st = groups[gk];
+
+            // HAVING: build a synthetic row with group key + aggregate values
+            if (!having_wc.empty()) {
+                Row having_row;
+                having_row.columns.resize(schema_.size(), std::monostate{});
+                for (size_t gi = 0; gi < group_cols.size(); gi++) {
+                    if (gi < gk.size())
+                        having_row.columns[group_cols[gi]] = gk[gi];
+                }
+                for (auto& sc : sel_cols) {
+                    if (sc.agg == AggFunc::NONE) continue;
+                    Value agg_val;
+                    switch (sc.agg) {
+                        case AggFunc::COUNT: agg_val = (int64_t)st.count; break;
+                        case AggFunc::SUM:   agg_val = st.sum; break;
+                        case AggFunc::AVG:   agg_val = st.count ? st.sum / st.count : 0.0; break;
+                        case AggFunc::MIN:   agg_val = st.has_min ? st.min_val : 0.0; break;
+                        case AggFunc::MAX:   agg_val = st.has_max ? st.max_val : 0.0; break;
+                        default: break;
+                    }
+                    having_row.columns[sc.col] = agg_val;
+                }
+                if (!eval_where(having_row, having_wc)) continue;
+            }
+
+            if (offset > 0) { offset--; continue; }
+
+            // Print group key columns then aggregates
+            size_t col_i = 0;
+            for (auto& sc : sel_cols) {
+                if (col_i > 0) std::cout << " | ";
+                col_i++;
+                if (sc.agg != AggFunc::NONE) {
+                    switch (sc.agg) {
+                        case AggFunc::COUNT: std::cout << st.count; break;
+                        case AggFunc::SUM:   std::cout << st.sum; break;
+                        case AggFunc::AVG:   std::cout << (st.count ? st.sum / st.count : 0); break;
+                        case AggFunc::MIN:   std::cout << (st.has_min ? st.min_val : 0); break;
+                        case AggFunc::MAX:   std::cout << (st.has_max ? st.max_val : 0); break;
+                        default: break;
+                    }
+                } else if (sc.col < schema_.size()) {
+                    // show group key column
+                    int gk_idx = -1;
+                    for (size_t gi = 0; gi < group_cols.size(); gi++) {
+                        if (group_cols[gi] == sc.col) { gk_idx = (int)gi; break; }
+                    }
+                    const auto& vref = (gk_idx >= 0 && (size_t)gk_idx < gk.size()) ? gk[gk_idx] : rows_[0].columns[sc.col];
+                    Value v = apply_scalar(sc.func, vref);
+                    if (is_null(v)) std::cout << "NULL";
+                    else std::visit([](auto&& x) {
+                        using T = std::decay_t<decltype(x)>;
+                        if constexpr (!std::is_same_v<T, std::monostate>) std::cout << x;
+                    }, v);
+                }
+            }
+            std::cout << "\n";
+            printed++;
+        }
+        std::cout << "  (" << printed << " row(s))\n";
+        return;
+    }
+
+    // --- Non-aggregate path: DISTINCT, ORDER BY, output ---
+
+    // DISTINCT: deduplicate by selected columns
+    if (distinct) {
+        std::vector<size_t> deduped;
+        auto row_key = [&](size_t ri) -> std::vector<Value> {
+            std::vector<Value> k;
+            for (auto& sc : sel_cols) k.push_back(ri < rows_.size() && sc.col < rows_[ri].columns.size() ? rows_[ri].columns[sc.col] : Value{});
+            return k;
+        };
+        std::set<std::vector<Value>> seen;
+        for (auto ri : filtered_idx) {
+            auto k = row_key(ri);
+            if (seen.insert(k).second) deduped.push_back(ri);
+        }
+        filtered_idx.swap(deduped);
+    }
+
+    // ORDER BY: sort indices
+    if (!order_by.empty()) {
+        std::sort(filtered_idx.begin(), filtered_idx.end(), [&](size_t a, size_t b) {
+            for (auto& ob : order_by) {
+                const auto& va = ob.col < rows_[a].columns.size() ? rows_[a].columns[ob.col] : Value{};
+                const auto& vb = ob.col < rows_[b].columns.size() ? rows_[b].columns[ob.col] : Value{};
+                int c = 0;
+                // Compare as variant
+                std::visit([&](auto&& x) {
+                    using T = std::decay_t<decltype(x)>;
+                    std::visit([&](auto&& y) {
+                        using U = std::decay_t<decltype(y)>;
+                        if constexpr (std::is_same_v<T, std::monostate> && std::is_same_v<U, std::monostate>) c = 0;
+                        else if constexpr (std::is_same_v<T, std::monostate>) c = -1;
+                        else if constexpr (std::is_same_v<U, std::monostate>) c = 1;
+                        else if constexpr (std::is_same_v<T, std::string> && std::is_same_v<U, std::string>) { if (x < y) c = -1; else if (x > y) c = 1; }
+                        else if constexpr (std::is_same_v<T, int32_t> && std::is_same_v<U, int32_t>) { if (x < y) c = -1; else if (x > y) c = 1; }
+                        else if constexpr (std::is_same_v<T, int64_t> && std::is_same_v<U, int64_t>) { if (x < y) c = -1; else if (x > y) c = 1; }
+                        else if constexpr (std::is_same_v<T, double> && std::is_same_v<U, double>) { if (x < y) c = -1; else if (x > y) c = 1; }
+                        else if constexpr (std::is_same_v<T, float> && std::is_same_v<U, float>) { if (x < y) c = -1; else if (x > y) c = 1; }
+                        else {
+                            // Cross-type: promote to double
+                            auto to_d = [](auto z) -> double {
+                                if constexpr (std::is_same_v<decltype(z), std::monostate>) return 0;
+                                else if constexpr (std::is_same_v<decltype(z), std::string>) return 0;
+                                else return (double)z;
+                            };
+                            double dx = to_d(x), dy = to_d(y);
+                            if (dx < dy) c = -1; else if (dx > dy) c = 1;
+                        }
+                    }, vb);
+                }, va);
+                if (c != 0) return ob.asc ? c < 0 : c > 0;
+            }
+            return false;
+        });
+    }
+
     // Print header
-    for (size_t i = 0; i < cols.size(); i++) {
+    for (size_t i = 0; i < sel_cols.size(); i++) {
         if (i > 0) std::cout << " | ";
-        std::cout << schema_[cols[i]].name;
+        auto& sc = sel_cols[i];
+        if (!sc.alias.empty()) std::cout << sc.alias;
+        else if (sc.func != ScalarFunc::NONE) {
+            const char* fn = "FN";
+            switch (sc.func) {
+                case ScalarFunc::UPPER: fn = "UPPER"; break;
+                case ScalarFunc::LOWER: fn = "LOWER"; break;
+                case ScalarFunc::LENGTH: fn = "LENGTH"; break;
+                default: break;
+            }
+            std::cout << fn << "(" << schema_[sc.col].name << ")";
+        } else std::cout << schema_[sc.col].name;
     }
     std::cout << "\n";
-    for (size_t i = 0; i < cols.size(); i++) {
+    for (size_t i = 0; i < sel_cols.size(); i++) {
         if (i > 0) std::cout << "-+-";
-        else { for (size_t j = 0; j < schema_[cols[i]].name.size(); j++) std::cout << "-"; }
+        else {
+            auto& sc = sel_cols[i];
+            std::string h = sc.alias.empty() ? schema_[sc.col].name : sc.alias;
+            for (size_t j = 0; j < h.size(); j++) std::cout << "-";
+        }
     }
-    if (cols.size() > 0) std::cout << "\n";
+    if (sel_cols.size() > 0) std::cout << "\n";
 
     size_t count = 0, skipped = 0;
-    for (auto& row : rows_) {
-        bool match = true;
-        for (auto& c : conds) { if (!eval(row, c)) { match = false; break; } }
-        if (!match) continue;
-
+    for (auto ri : filtered_idx) {
+        auto& row = rows_[ri];
         if (skipped < offset) { skipped++; continue; }
         if (limit > 0 && count >= limit) break;
 
-        for (size_t i = 0; i < cols.size(); i++) {
+        for (size_t i = 0; i < sel_cols.size(); i++) {
             if (i > 0) std::cout << " | ";
-            auto& val = row.columns[cols[i]];
+            auto& sc = sel_cols[i];
+            Value val = apply_scalar(sc.func, row.columns[sc.col]);
             if (is_null(val)) std::cout << "NULL";
             else {
                 std::visit([&](auto&& v) {
@@ -1895,19 +2546,17 @@ void Database::exec_update(const std::vector<std::string>& tok, size_t& pos) {
         if (pos < tok.size() && tok[pos] == ",") pos++;
     }
 
-    std::vector<Condition> conds;
-    if (pos < tok.size() && to_upper(tok[pos]) == "WHERE") { pos++; conds = parse_where(tok, pos); }
+    WhereClause wc;
+    if (pos < tok.size() && to_upper(tok[pos]) == "WHERE") { pos++; wc = parse_where(tok, pos); }
 
     size_t updated = 0;
     for (size_t i = 0; i < rows_.size(); i++) {
-        bool match = true;
-        for (auto& c : conds) { if (!eval(rows_[i], c)) { match = false; break; } }
-        if (!match) continue;
+        if (!eval_where(rows_[i], wc)) continue;
 
         Row new_row = rows_[i];
         for (auto& [cn, v] : assigns) {
             size_t ci = resolve_col(cn);
-            if (ci < new_row.columns.size()) new_row.columns[ci] = v;
+            if (ci < new_row.columns.size()) new_row.columns[ci] = ci < schema_.size() ? coerce_value(v, schema_[ci].type) : v;
         }
 
         auto bytes = row_to_bytes(new_row);
@@ -1932,8 +2581,8 @@ void Database::exec_delete(const std::vector<std::string>& tok, size_t& pos) {
     pos++;
     pos++; // table name
 
-    std::vector<Condition> conds;
-    if (pos < tok.size() && to_upper(tok[pos]) == "WHERE") { pos++; conds = parse_where(tok, pos); }
+    WhereClause wc;
+    if (pos < tok.size() && to_upper(tok[pos]) == "WHERE") { pos++; wc = parse_where(tok, pos); }
     else {
         // DELETE all
         if (rows_.empty()) { std::cout << "  0 row(s) deleted\n"; return; }
@@ -1954,9 +2603,7 @@ void Database::exec_delete(const std::vector<std::string>& tok, size_t& pos) {
     size_t deleted = 0;
     for (size_t i = rows_.size(); i > 0; i--) {
         size_t idx = i - 1;
-        bool match = true;
-        for (auto& c : conds) { if (!eval(rows_[idx], c)) { match = false; break; } }
-        if (!match) continue;
+        if (!eval_where(rows_[idx], wc)) continue;
 
         uint64_t di = (uint64_t)idx;
         if (wal_append((uint8_t)WalOp::DELETE, (const uint8_t*)&di, 8)) {
@@ -1966,6 +2613,76 @@ void Database::exec_delete(const std::vector<std::string>& tok, size_t& pos) {
         }
     }
     std::cout << "  " << deleted << " row(s) deleted\n";
+}
+
+void Database::exec_alter(const std::vector<std::string>& tok, size_t& pos) {
+    if (schema_.empty()) { std::cout << "  no table\n"; return; }
+    if (pos >= tok.size() || to_upper(tok[pos]) != "TABLE") { std::cout << "  syntax: ALTER TABLE name ADD|DROP COLUMN ...\n"; return; }
+    pos++;
+    pos++; // table name
+    if (pos >= tok.size()) { std::cout << "  expected ADD or DROP\n"; return; }
+    std::string action = to_upper(tok[pos++]);
+    if (pos >= tok.size() || to_upper(tok[pos]) != "COLUMN") { std::cout << "  expected COLUMN\n"; return; }
+    pos++;
+    if (action == "ADD") {
+        if (pos >= tok.size()) { std::cout << "  syntax: ALTER TABLE name ADD COLUMN name type\n"; return; }
+        std::string col = tok[pos++];
+        if (pos >= tok.size()) { std::cout << "  expected type\n"; return; }
+        std::string type_str = to_upper(tok[pos++]);
+        ColumnType ct;
+        if (type_str == "I32" || type_str == "INT" || type_str == "INTEGER") ct = ColumnType::I32;
+        else if (type_str == "I64" || type_str == "BIGINT") ct = ColumnType::I64;
+        else if (type_str == "F32" || type_str == "FLOAT") ct = ColumnType::F32;
+        else if (type_str == "F64" || type_str == "DOUBLE") ct = ColumnType::F64;
+        else if (type_str == "STRING" || type_str == "TEXT" || type_str == "VARCHAR") ct = ColumnType::STRING;
+        else { std::cout << "  unknown type: " << type_str << "\n"; return; }
+        bool nullable = true;
+        Encoding enc = Encoding::PLAIN;
+        while (pos < tok.size() && to_upper(tok[pos]) != "ADD" && to_upper(tok[pos]) != "DROP") {
+            std::string kw = to_upper(tok[pos]);
+            if (kw == "NOT" && pos + 1 < tok.size() && to_upper(tok[pos+1]) == "NULL") { nullable = false; pos += 2; }
+            else if (kw == "NULL" || kw == "NULLABLE") { nullable = true; pos++; }
+            else if (kw == "DICT") { enc = Encoding::DICT; pos++; }
+            else if (kw == "BIT_PACKED") { enc = Encoding::BIT_PACKED; pos++; }
+            else if (kw == "PLAIN") { enc = Encoding::PLAIN; pos++; }
+            else break;
+        }
+        ColMeta cm;
+        cm.name = col; cm.type = ct; cm.nullable = nullable; cm.encoding = enc;
+        schema_.push_back(cm);
+        for (auto& row : rows_) row.columns.push_back(std::monostate{});
+        dirty_ = true;
+        std::cout << "  column '" << col << "' added\n";
+    } else if (action == "DROP") {
+        if (pos >= tok.size()) { std::cout << "  syntax: ALTER TABLE name DROP COLUMN name\n"; return; }
+        std::string col = tok[pos++];
+        size_t ci = resolve_col(col);
+        if (ci == (size_t)-1) { std::cout << "  unknown column: " << col << "\n"; return; }
+        schema_.erase(schema_.begin() + ci);
+        for (auto& row : rows_) {
+            if (ci < row.columns.size()) row.columns.erase(row.columns.begin() + ci);
+        }
+        dirty_ = true;
+        std::cout << "  column '" << col << "' dropped\n";
+    } else {
+        std::cout << "  expected ADD or DROP, got " << action << "\n";
+    }
+}
+
+void Database::exec_drop(const std::vector<std::string>& tok, size_t& pos) {
+    if (schema_.empty()) { std::cout << "  no table\n"; return; }
+    if (pos >= tok.size() || to_upper(tok[pos]) != "TABLE") { std::cout << "  syntax: DROP TABLE name\n"; return; }
+    pos++;
+    pos++; // table name
+
+    // Log a special checkpoint to invalidate all prior WAL entries
+    uint64_t kill_seq = wal_seq_ + 1;
+    wal_append((uint8_t)WalOp::CHECKPOINT, (const uint8_t*)&kill_seq, 8);
+
+    rows_.clear();
+    schema_.clear();
+    dirty_ = false;
+    std::cout << "  table dropped\n";
 }
 
 } // namespace zepto

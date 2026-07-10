@@ -113,15 +113,33 @@ db.close();
 ### SQL Commands
 
 ```
-CREATE TABLE name (col TYPE, ...)
+CREATE TABLE name (col TYPE [NOT NULL] [DICT|BIT_PACKED], ...)
 INSERT INTO name VALUES (val, ...)
-SELECT * | cols FROM name [WHERE cond [AND ...]] [LIMIT n] [OFFSET n]
+SELECT [DISTINCT] *|cols|agg(col)|UPPER(col)|LOWER(col)|LENGTH(col) [AS alias], ...
+  FROM name
+  [WHERE cond [AND|OR ...]]
+  [GROUP BY col, ...]
+  [HAVING cond]
+  [ORDER BY col [ASC|DESC], ...]
+  [LIMIT n]
+  [OFFSET n]
 UPDATE name SET col=val, ... WHERE cond
 DELETE FROM name WHERE cond
+DROP TABLE name
+ALTER TABLE name ADD COLUMN col TYPE [NOT NULL] [DICT|BIT_PACKED]
+ALTER TABLE name DROP COLUMN col
 BEGIN / COMMIT / ROLLBACK
 ```
 
-Types: `I32`/`INT`, `I64`/`BIGINT`, `F32`/`FLOAT`, `F64`/`DOUBLE`, `STRING`/`TEXT`
+Types: `I32`/`INT`, `I64`/`BIGINT`, `F32`/`FLOAT`, `F64`/`DOUBLE`, `STRING`/`TEXT`/`VARCHAR`
+
+WHERE operators: `=` `!=` `<>` `<` `>` `<=` `>=` `LIKE` `NOT LIKE` `IS NULL` `IS NOT NULL` `IN` `NOT IN` `BETWEEN`
+
+Aggregate functions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`
+
+Scalar functions: `UPPER(col)`, `LOWER(col)`, `LENGTH(col)`
+
+Column aliases: `col AS alias`, `func(col) AS alias`
 
 ### Dot-Commands
 
@@ -130,6 +148,8 @@ Types: `I32`/`INT`, `I64`/`BIGINT`, `F32`/`FLOAT`, `F64`/`DOUBLE`, `STRING`/`TEX
 .snapshot <name>     — CoW copy of current state
 .snapshots           — list snapshots
 .restore <name>      — restore from a snapshot
+.tables              — list tables (database directory name)
+.schema              — show table DDL
 .help                — command reference
 .exit / .quit        — exit REPL
 ```
@@ -186,7 +206,7 @@ Uncheckpointed mutations survive crashes (the WAL is `fsync`-flushed on every ap
 
 ## Python Bindings
 
-Build `zepto.dll` via `make python`, then import the `zepto` package from the repo root:
+Build `zepto.dll` via `make python`, then use the `zepto` package from the repo root:
 
 ```python
 import zepto
@@ -205,17 +225,20 @@ for row in rows:
     print(row)  # ['alice', 30], ['bob', 25], [None, 35]
 
 # WAL+CoW Database
-db = zepto.open('mydb')
-db.exec('CREATE TABLE users (name STRING, age I32)')
-db.exec("INSERT INTO users VALUES ('alice', 30)")
-db.exec("INSERT INTO users VALUES ('bob', 25)")
+db = zepto.Database('mydb')
+db.exec('CREATE TABLE users (name STRING, age I32, salary F64)')
+db.exec("INSERT INTO users VALUES ('alice', 30, 80000)")
+db.exec("INSERT INTO users VALUES ('bob', 25, 55000)")
+db.exec("INSERT INTO users VALUES ('charlie', 30, 90000)")
+db.exec("SELECT name, UPPER(name), AVG(salary) FROM users GROUP BY name")
 db.snapshot('v1')
-db.exec('DELETE FROM users WHERE name = "bob"')
+db.exec('DELETE FROM users WHERE age > 25')
 db.restore('v1')
 print(db.list_snapshots())  # ['v1']
+db.close()
 ```
 
-No Python dependencies — uses only `ctypes` from the standard library.
+All SQL features (aggregates, GROUP BY, HAVING, ORDER BY, scalar functions, aliases, ALTER TABLE, etc.) work through `db.exec()`. No Python dependencies — uses only `ctypes` from the standard library.
 
 ## Implementation Notes
 
