@@ -1,7 +1,7 @@
 #include "zepto.h"
 #include <iostream>
 int main() {
-    { zepto::Writer w("corrupt.rw.zepto", 4096);
+    { zepto::Writer w("corrupt.rw.zdb", 4096);
       w.add_column("id", zepto::ColumnType::I32, false, zepto::Encoding::BIT_PACKED);
       w.add_column("val", zepto::ColumnType::I64);
       w.add_column("tag", zepto::ColumnType::STRING, false, zepto::Encoding::DICT);
@@ -12,7 +12,7 @@ int main() {
                         (i%5==0)?zepto::Value{}:zepto::Value((double)i*0.5)});
         w.flush_chunk();
     }}
-    zepto::Reader r("corrupt.rw.zepto");
+    zepto::Reader r("corrupt.rw.zdb");
     std::cout << "open=" << r.open() << " integ=" << r.verify_integrity()
               << " chunks=" << r.num_chunks() << " rows=" << r.num_rows() << "\n";
     auto m0 = r.chunk_meta(0);

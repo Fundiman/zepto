@@ -12,8 +12,13 @@
 namespace zepto {
 
 constexpr uint32_t MAGIC = 0x5450455A; // "ZEPT" little-endian
-constexpr uint16_t VERSION = 2;
+constexpr uint16_t VERSION = 3;
 constexpr size_t DEFAULT_CHUNK_SIZE = 64 * 1024 * 1024; // 64MB
+
+// File-level flags (stored in header flags field, 4 bytes at offset 24)
+constexpr uint32_t FLAG_RS_ECC   = 0x01;  // bit 0: chunks use RS error correction
+constexpr uint32_t FLAG_LZ4      = 0x02;  // bit 1: pages use LZ4 block compression
+constexpr uint32_t FLAG_ZSTD     = 0x04;  // bit 2: pages use ZSTD block compression
 
 constexpr uint8_t COL_NULLABLE = 0x01;
 
@@ -30,6 +35,13 @@ enum class Encoding : uint8_t {
     DICT = 1,
     BIT_PACKED = 2,
     DELTA = 3,
+};
+
+// Compression codec applied to each chunk (stored in file header flags)
+enum class Codec : uint8_t {
+    NONE = 0,
+    LZ4 = 1,
+    ZSTD = 2,
 };
 
 struct PageHeader {
@@ -108,7 +120,8 @@ struct QueryResult {
 
 class Writer {
 public:
-    Writer(std::string path, size_t chunk_size = DEFAULT_CHUNK_SIZE);
+    Writer(std::string path, size_t chunk_size = DEFAULT_CHUNK_SIZE,
+           bool use_rs = false, Codec codec = Codec::NONE);
     ~Writer();
     Writer(const Writer&) = delete;
     Writer& operator=(const Writer&) = delete;
@@ -117,15 +130,40 @@ public:
 
     bool add_column(const std::string& name, ColumnType type, bool nullable = false, Encoding encoding = Encoding::PLAIN);
     bool append_row(const std::vector<Value>& row);
+    bool begin_batch();
+    bool push_value(size_t col_idx, Value val);
+    bool push_col_i32(size_t col_idx, const int32_t* vals, size_t count);
+    bool push_col_i64(size_t col_idx, const int64_t* vals, size_t count);
+    bool push_col_f32(size_t col_idx, const float* vals, size_t count);
+    bool push_col_f64(size_t col_idx, const double* vals, size_t count);
+    bool push_col_str(size_t col_idx, const char* const* strs, const size_t* lens, size_t count);
+    bool end_batch();
+    bool finish_batch(size_t num_rows);
     uint64_t flush_chunk();
     uint64_t rows_written() const { return total_rows_; }
     void close();
+
+    // Typed columnar write: encode directly from raw arrays (no variant overhead)
+    struct WriteColArray {
+        ColumnType type;
+        const uint8_t* data = nullptr;       // typed values
+        const uint8_t* validity = nullptr;   // null bitmap (1=valid, 0=null)
+        size_t num_values = 0;
+    };
+    void write_chunk_cols(const std::vector<WriteColArray>& cols,
+                          const std::vector<ColMeta>& meta,
+                          uint32_t idx);
+
+    // High-level: write a full chunk from typed arrays (handles metadata + state)
+    bool write_columns(const std::vector<WriteColArray>& cols, int num_rows);
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::string path_;
     size_t chunk_size_;
+    bool use_rs_;
+    Codec codec_;
     std::vector<ColMeta> col_meta_;
     std::vector<std::vector<Value>> pending_;
     size_t pending_bytes_ = 0;
@@ -163,6 +201,17 @@ public:
     std::vector<Row> read_chunk(size_t chunk_idx);
     ChunkMeta chunk_meta(size_t chunk_idx) const;
 
+    // Typed columnar read — returns raw arrays per column, no variant overhead
+    struct ColumnArray {
+        ColumnType type;
+        std::vector<uint8_t> data;       // typed values (int32_t[], double[], etc.)
+        std::vector<uint8_t> validity;   // null bitmap (1=valid, 0=null)
+        std::vector<size_t> offsets;     // flat string layout: offsets[i] = start of string i in data
+        size_t num_values = 0;
+    };
+    std::vector<ColumnArray> read_chunk_cols(size_t chunk_idx,
+                                             const std::vector<size_t>& col_indices = {});
+
     bool verify_integrity();
 
 private:
@@ -176,9 +225,12 @@ private:
     std::vector<ChunkMeta> chunks_;
     size_t total_rows_ = 0;
     bool opened_ = false;
+    bool use_rs_ = false;
+    Codec codec_ = Codec::NONE;
 
     bool read_header();
     bool read_chunk_meta(ChunkMeta& meta);
+    std::vector<uint8_t> read_and_decode_chunk(size_t chunk_idx);
 };
 
 inline bool is_null(const Value& v) {
@@ -208,6 +260,13 @@ public:
     bool create_snapshot(const std::string& name);
     bool restore_snapshot(const std::string& name);
     std::vector<std::string> list_snapshots();
+
+    // Query results from last SELECT exec()
+    const std::vector<std::string>& query_col_names() const { return query_col_names_; }
+    const std::vector<ColumnType>& query_col_types() const { return query_col_types_; }
+    const std::vector<std::vector<std::string>>& query_rows() const { return query_rows_; }
+    int query_row_count() const { return (int)query_rows_.size(); }
+    int query_col_count() const { return (int)query_col_names_.size(); }
 
 private:
     struct Condition {
@@ -276,6 +335,11 @@ private:
     uint64_t checkpoint_seq_ = 0;
     bool dirty_ = false;
     bool opened_ = false;
+
+    // query result storage (populated by exec_select)
+    std::vector<std::string> query_col_names_;
+    std::vector<ColumnType> query_col_types_;
+    std::vector<std::vector<std::string>> query_rows_;
     std::ofstream wal_stream_;
 };
 

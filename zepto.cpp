@@ -10,6 +10,8 @@
 #include <filesystem>
 #include <set>
 #include <map>
+#include <unordered_map>
+#include <zstd.h>
 namespace fs = std::filesystem;
 
 namespace zepto {
@@ -27,6 +29,142 @@ static void init_crc32c() {
         table[i] = crc;
     }
     table_init = true;
+}
+
+// ---- LZ4 Block Compression (fast hash-chain implementation) ----
+
+static std::vector<uint8_t> lz4_compress(const uint8_t* src, size_t src_size) {
+    if (src_size == 0) return {};
+    std::vector<uint8_t> out;
+    out.reserve(src_size + src_size / 4 + 8);
+
+    // Reserve 4 bytes for uncompressed size, patch later
+    out.resize(4);
+
+    constexpr int HASH_BITS = 12;
+    constexpr int HASH_SIZE = 1 << HASH_BITS;
+    constexpr int MAX_DIST = 65535;
+    std::vector<int32_t> ht(HASH_SIZE, -1);
+    auto hfn = [](const uint8_t* p) -> int {
+        uint32_t v; memcpy(&v, p, 3);
+        return (int)((v * 0x1E35A7BDu) >> (32 - HASH_BITS)) & (HASH_SIZE - 1);
+    };
+
+    size_t ip = 0;
+    while (ip < src_size) {
+        // Find match
+        int best_len = 0, best_off = 0;
+        if (ip + 3 < src_size) {
+            int h = hfn(src + ip);
+            int32_t ch = ht[h];
+            if (ch >= 0 && ip - (size_t)ch <= MAX_DIST) {
+                size_t mx = src_size - ip;
+                if (mx > 18) mx = 18;
+                int len = 0;
+                while ((size_t)len < mx && src[ch + len] == src[ip + len]) len++;
+                if (len >= 4) { best_len = len; best_off = (int)(ip - (size_t)ch); }
+            }
+            ht[h] = (int32_t)ip;
+        }
+
+        if (best_len >= 4) {
+            // Emit match token with 0 literals
+            int match_len = best_len - 4;
+            out.push_back((uint8_t)match_len);
+            out.push_back((uint8_t)(best_off));
+            out.push_back((uint8_t)(best_off >> 8));
+            for (size_t j = 1; j < (size_t)best_len && ip + j + 3 < src_size; j++) {
+                ht[hfn(src + ip + j)] = (int32_t)(ip + j);
+            }
+            ip += best_len;
+        } else {
+            // Literal run
+            size_t lit_start = ip;
+            int lit_count = 0;
+            while (ip < src_size && lit_count < 15) {
+                if (ip + 3 < src_size) {
+                    int h = hfn(src + ip);
+                    int32_t ch = ht[h];
+                    if (ch >= 0 && (int32_t)ip != ch && ip - (size_t)ch <= MAX_DIST) {
+                        size_t mx = src_size - ip;
+                        if (mx > 18) mx = 18;
+                        int len = 0;
+                        while ((size_t)len < mx && src[ch + len] == src[ip + len]) len++;
+                        if (len >= 4) break;
+                    }
+                    ht[h] = (int32_t)ip;
+                }
+                lit_count++;
+                ip++;
+            }
+            out.push_back((uint8_t)(lit_count << 4));
+            out.insert(out.end(), src + lit_start, src + lit_start + lit_count);
+        }
+    }
+
+    // Patch uncompressed size
+    out[0] = (uint8_t)(src_size);
+    out[1] = (uint8_t)(src_size >> 8);
+    out[2] = (uint8_t)(src_size >> 16);
+    out[3] = (uint8_t)(src_size >> 24);
+    return out;
+}
+
+static std::vector<uint8_t> lz4_decompress(const uint8_t* src, size_t src_size, size_t max_out = 0) {
+    if (src_size < 4) return {};
+    uint32_t uncomp_size = 0;
+    memcpy(&uncomp_size, src, 4);
+    if (max_out > 0 && uncomp_size > max_out) return {};
+    std::vector<uint8_t> out;
+    out.reserve(uncomp_size);
+    size_t ip = 4;
+    while (ip < src_size && out.size() < uncomp_size) {
+        uint8_t token = src[ip++];
+        int lit_len = (token >> 4) & 0x0F;
+        int match_len = token & 0x0F;
+        if (ip + lit_len > src_size) break;
+        out.insert(out.end(), src + ip, src + ip + lit_len);
+        ip += lit_len;
+        if (match_len > 0 || (lit_len == 0 && out.size() < uncomp_size)) {
+            if (ip + 2 > src_size) break;
+            uint16_t offset = (uint16_t)src[ip] | ((uint16_t)src[ip + 1] << 8);
+            ip += 2;
+            match_len += 4;
+            if (offset == 0 || offset > out.size()) break;
+            size_t match_pos = out.size() - offset;
+            for (int i = 0; i < match_len && out.size() < uncomp_size; i++) {
+                out.push_back(out[match_pos + i]);
+            }
+        }
+    }
+    out.resize(uncomp_size);
+    return out;
+}
+
+// ---- ZSTD block compression (via libzstd) ----
+
+static constexpr int ZSTD_LEVEL = 1;
+
+static std::vector<uint8_t> zstd_compress(const uint8_t* src, size_t src_size) {
+    if (src_size == 0) return {};
+    size_t bound = ZSTD_compressBound(src_size);
+    std::vector<uint8_t> out(bound);
+    size_t n = ZSTD_compress(out.data(), bound, src, src_size, ZSTD_LEVEL);
+    if (ZSTD_isError(n)) return {};
+    out.resize(n);
+    return out;
+}
+
+static std::vector<uint8_t> zstd_decompress(const uint8_t* src, size_t src_size, size_t max_out = 0) {
+    if (src_size == 0) return {};
+    size_t content = ZSTD_getFrameContentSize(src, src_size);
+    if (content == ZSTD_CONTENTSIZE_ERROR || content == ZSTD_CONTENTSIZE_UNKNOWN) return {};
+    if (max_out > 0 && content > max_out) return {};
+    std::vector<uint8_t> out(content);
+    size_t n = ZSTD_decompress(out.data(), out.size(), src, src_size);
+    if (ZSTD_isError(n)) return {};
+    out.resize(n);
+    return out;
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -316,19 +454,24 @@ struct Writer::Impl {
     std::ofstream file;
 };
 
-Writer::Writer(std::string path, size_t chunk_size)
-    : path_(std::move(path)), chunk_size_(chunk_size) {
+Writer::Writer(std::string path, size_t chunk_size, bool use_rs, Codec codec)
+    : path_(std::move(path)), chunk_size_(chunk_size), use_rs_(use_rs), codec_(codec) {
     impl_ = std::make_unique<Impl>();
     impl_->file.open(path_, std::ios::binary);
     if (!impl_->file.is_open())
         throw std::runtime_error("zepto: cannot open " + path_);
-    // header: magic(4) + version(2) + num_columns(2) + total_rows(8) + num_chunks(4) + meta_size(4) = 24
+    // VERSION 3 header: magic(4) + version(2) + num_columns(2) + total_rows(8) + num_chunks(4) + meta_size(4) + flags(4) = 28
     write_le<uint32_t>(impl_->file, MAGIC);
     write_le<uint16_t>(impl_->file, VERSION);
     write_le<uint16_t>(impl_->file, 0); // num_columns placeholder
     write_le<uint64_t>(impl_->file, 0); // total_rows placeholder
     write_le<uint32_t>(impl_->file, 0); // num_chunks placeholder
     write_le<uint32_t>(impl_->file, 0); // meta_size placeholder
+    uint32_t flags = 0;
+    if (use_rs_) flags |= FLAG_RS_ECC;
+    if (codec_ == Codec::LZ4) flags |= FLAG_LZ4;
+    if (codec_ == Codec::ZSTD) flags |= FLAG_ZSTD;
+    write_le<uint32_t>(impl_->file, flags); // flags
 }
 
 Writer::~Writer() { close(); }
@@ -367,6 +510,96 @@ bool Writer::append_row(const std::vector<Value>& row) {
     return true;
 }
 
+bool Writer::begin_batch() {
+    if (closed_) return false;
+    if (!metadata_written_) write_metadata();
+    if (pending_.empty()) pending_.resize(col_meta_.size());
+    return true;
+}
+
+bool Writer::push_value(size_t col_idx, Value val) {
+    if (col_idx >= col_meta_.size()) return false;
+    pending_[col_idx].push_back(std::move(val));
+    auto& v = pending_[col_idx].back();
+    if (!std::holds_alternative<std::monostate>(v)) {
+        switch (col_meta_[col_idx].type) {
+            case ColumnType::I32: pending_bytes_ += 4; break;
+            case ColumnType::I64: pending_bytes_ += 8; break;
+            case ColumnType::F32: pending_bytes_ += 4; break;
+            case ColumnType::F64: pending_bytes_ += 8; break;
+            case ColumnType::STRING: pending_bytes_ += 4 + std::get<std::string>(v).size(); break;
+        }
+    }
+    return true;
+}
+
+bool Writer::end_batch() {
+    total_rows_++;
+    if (pending_bytes_ >= chunk_size_) flush_chunk();
+    return true;
+}
+
+bool Writer::finish_batch(size_t num_rows) {
+    total_rows_ += num_rows;
+    if (pending_bytes_ >= chunk_size_) flush_chunk();
+    return true;
+}
+
+bool Writer::push_col_i32(size_t col_idx, const int32_t* vals, size_t count) {
+    if (col_idx >= col_meta_.size()) return false;
+    auto& col = pending_[col_idx];
+    col.reserve(col.size() + count);
+    for (size_t i = 0; i < count; i++)
+        col.push_back(vals[i]);
+    pending_bytes_ += count * 4;
+    return true;
+}
+
+bool Writer::push_col_i64(size_t col_idx, const int64_t* vals, size_t count) {
+    if (col_idx >= col_meta_.size()) return false;
+    auto& col = pending_[col_idx];
+    col.reserve(col.size() + count);
+    for (size_t i = 0; i < count; i++)
+        col.push_back(vals[i]);
+    pending_bytes_ += count * 8;
+    return true;
+}
+
+bool Writer::push_col_f32(size_t col_idx, const float* vals, size_t count) {
+    if (col_idx >= col_meta_.size()) return false;
+    auto& col = pending_[col_idx];
+    col.reserve(col.size() + count);
+    for (size_t i = 0; i < count; i++)
+        col.push_back(vals[i]);
+    pending_bytes_ += count * 4;
+    return true;
+}
+
+bool Writer::push_col_f64(size_t col_idx, const double* vals, size_t count) {
+    if (col_idx >= col_meta_.size()) return false;
+    auto& col = pending_[col_idx];
+    col.reserve(col.size() + count);
+    for (size_t i = 0; i < count; i++)
+        col.push_back(vals[i]);
+    pending_bytes_ += count * 8;
+    return true;
+}
+
+bool Writer::push_col_str(size_t col_idx, const char* const* strs, const size_t* lens, size_t count) {
+    if (col_idx >= col_meta_.size()) return false;
+    auto& col = pending_[col_idx];
+    col.reserve(col.size() + count);
+    for (size_t i = 0; i < count; i++) {
+        if (strs[i] == nullptr)
+            col.push_back(std::monostate{});
+        else {
+            col.push_back(std::string(strs[i], lens[i]));
+            pending_bytes_ += 4 + lens[i];
+        }
+    }
+    return true;
+}
+
 void Writer::write_metadata() {
     auto& f = impl_->file;
     std::vector<uint8_t> meta_buf;
@@ -393,7 +626,7 @@ void Writer::write_metadata() {
 
     // update meta_size and num_columns in header (don't disturb file position)
     auto after_meta = f.tellp();
-    f.seekp(4);
+    f.seekp(6);
     write_le<uint16_t>(f, (uint16_t)col_meta_.size());
     f.seekp(20);
     write_le<uint32_t>(f, meta_size);
@@ -538,19 +771,20 @@ void Writer::write_chunk(const std::vector<std::vector<Value>>& cols,
         case ColumnType::STRING:
             if (enc == Encoding::DICT) {
                 std::vector<std::string> dict;
-                std::vector<int> map;
+                std::unordered_map<std::string, uint32_t> dict_map;
                 std::vector<uint32_t> indices;
                 indices.reserve(col_data.size());
                 for (auto& v : col_data) {
                     if (is_null(v)) { indices.push_back(UINT32_MAX); continue; }
                     const auto& s = std::get<std::string>(v);
-                    auto it = std::find(dict.begin(), dict.end(), s);
+                    auto it = dict_map.find(s);
                     uint32_t idx;
-                    if (it == dict.end()) {
+                    if (it == dict_map.end()) {
                         idx = (uint32_t)dict.size();
+                        dict_map[s] = idx;
                         dict.push_back(s);
                     } else {
-                        idx = (uint32_t)(it - dict.begin());
+                        idx = it->second;
                     }
                     indices.push_back(idx);
                     if (!zm.has_min || s < zm.min_str) { zm.min_str = s; zm.has_min = true; }
@@ -561,9 +795,12 @@ void Writer::write_chunk(const std::vector<std::vector<Value>>& cols,
                     wp((uint32_t)entry.size());
                     w(entry.data(), entry.size());
                 }
-                for (auto idx : indices) {
-                    wp(idx);
-                }
+                uint8_t bits = dict.size() <= 1 ? 1 : (uint8_t)std::bit_width((uint64_t)dict.size() - 1);
+                wp(bits);
+                std::vector<int64_t> idx64(indices.begin(), indices.end());
+                std::vector<uint8_t> packed;
+                pack_bits(idx64.data(), idx64.size(), 0, bits, packed);
+                w(packed.data(), packed.size());
             } else {
                 for (auto& v : col_data) {
                     if (is_null(v)) continue;
@@ -607,15 +844,42 @@ void Writer::write_chunk(const std::vector<std::vector<Value>>& cols,
     uint32_t chunk_crc = crc32c(buf.data(), buf.size());
     wp(chunk_crc);
 
-    // QR-style interleaved RS encoding
-    uint32_t orig_size = (uint32_t)buf.size();
-    auto interleaved = rs_encode_interleaved(buf.data(), buf.size());
+    uint32_t raw_size = (uint32_t)buf.size();
 
-    // On-disk: [MAGIC(4)][orig_size(4)][interleaved_blob]
-    f.write(reinterpret_cast<const char*>(buf.data()), 4);
-    write_le<uint32_t>(f, orig_size);
-    f.write(reinterpret_cast<const char*>(interleaved.data()),
-            (std::streamsize)interleaved.size());
+    if (use_rs_) {
+        // VERSION 2-compatible RS encoding
+        auto interleaved = rs_encode_interleaved(buf.data(), buf.size());
+        f.write(reinterpret_cast<const char*>(buf.data()), 4);
+        write_le<uint32_t>(f, raw_size);
+        f.write(reinterpret_cast<const char*>(interleaved.data()),
+                (std::streamsize)interleaved.size());
+    } else if (codec_ == Codec::LZ4) {
+        // LZ4 compress the chunk buffer
+        auto compressed = lz4_compress(buf.data(), buf.size());
+        uint32_t comp_size = (uint32_t)compressed.size();
+        f.write(reinterpret_cast<const char*>(buf.data()), 4); // MAGIC
+        write_le<uint32_t>(f, raw_size);
+        write_le<uint32_t>(f, comp_size);
+        f.write(reinterpret_cast<const char*>(compressed.data()),
+                (std::streamsize)compressed.size());
+    } else if (codec_ == Codec::ZSTD) {
+        // ZSTD compress the chunk buffer
+        auto compressed = zstd_compress(buf.data(), buf.size());
+        if (compressed.empty())
+            throw std::runtime_error("zepto: zstd compress failed");
+        uint32_t comp_size = (uint32_t)compressed.size();
+        f.write(reinterpret_cast<const char*>(buf.data()), 4); // MAGIC
+        write_le<uint32_t>(f, raw_size);
+        write_le<uint32_t>(f, comp_size);
+        f.write(reinterpret_cast<const char*>(compressed.data()),
+                (std::streamsize)compressed.size());
+    } else {
+        // No RS, no compression: write raw chunk buffer
+        f.write(reinterpret_cast<const char*>(buf.data()), 4); // MAGIC
+        write_le<uint32_t>(f, raw_size);
+        write_le<uint32_t>(f, raw_size); // comp_size = raw_size
+        f.write(reinterpret_cast<const char*>(buf.data()), raw_size); // full chunk as payload
+    }
 
     // update file header
     f.seekp(0);
@@ -627,6 +891,283 @@ void Writer::write_chunk(const std::vector<std::vector<Value>>& cols,
     fw((uint32_t)chunk_index_);
     // meta_size stays unchanged at offset 20
     f.seekp(0, std::ios::end);
+}
+
+void Writer::write_chunk_cols(const std::vector<WriteColArray>& cols,
+                              const std::vector<ColMeta>& meta,
+                              uint32_t idx) {
+    auto& f = impl_->file;
+    std::vector<uint8_t> buf;
+
+    auto w = [&](const void* d, size_t n) {
+        auto* p = static_cast<const uint8_t*>(d);
+        buf.insert(buf.end(), p, p + n);
+    };
+    auto wp = [&](const auto& v) { w(&v, sizeof(v)); };
+
+    struct PageInfo { uint64_t offset; uint32_t comp_size, crc; ZoneMap zm; uint32_t validity_size; };
+    std::vector<PageInfo> pages(cols.size());
+
+    wp(MAGIC);
+    wp((uint16_t)idx);
+    wp((uint16_t)cols.size());
+    wp((uint32_t)(cols.empty() ? 0 : (uint32_t)cols[0].num_values));
+    size_t dir_off_pos = buf.size();
+    wp((uint32_t)0);
+
+    for (size_t ci = 0; ci < cols.size(); ci++) {
+        pages[ci].offset = buf.size();
+        ZoneMap& zm = pages[ci].zm;
+        auto& ca = cols[ci];
+        Encoding enc = meta[ci].encoding;
+        bool nullable = meta[ci].nullable;
+        size_t nrows = ca.num_values;
+
+        if (nullable && ca.validity) {
+            size_t bmp_size = (nrows + 7) / 8;
+            pages[ci].validity_size = (uint32_t)bmp_size;
+            w(ca.validity, bmp_size);
+        } else if (nullable) {
+            size_t bmp_size = (nrows + 7) / 8;
+            std::vector<uint8_t> all_valid(bmp_size, 0xFF);
+            pages[ci].validity_size = (uint32_t)bmp_size;
+            w(all_valid.data(), bmp_size);
+        } else {
+            pages[ci].validity_size = 0;
+        }
+
+        auto get_valid = [&](size_t i) -> bool {
+            if (!ca.validity) return true;
+            return (ca.validity[i / 8] >> (i % 8)) & 1;
+        };
+
+        switch (meta[ci].type) {
+        case ColumnType::I32: {
+            const int32_t* vals = reinterpret_cast<const int32_t*>(ca.data);
+            if (enc == Encoding::BIT_PACKED) {
+                int32_t cmin = INT32_MAX, cmax = INT32_MIN;
+                for (size_t i = 0; i < nrows; i++) {
+                    if (!get_valid(i)) continue;
+                    if (vals[i] < cmin) cmin = vals[i];
+                    if (vals[i] > cmax) cmax = vals[i];
+                }
+                int64_t range = (int64_t)cmax - (int64_t)cmin;
+                uint8_t bits = range == 0 ? 1 : (uint8_t)(std::bit_width((uint64_t)range));
+                if (bits > 32) bits = 32;
+                wp(cmin);
+                wp(bits);
+                std::vector<int64_t> tmp;
+                tmp.reserve(nrows);
+                for (size_t i = 0; i < nrows; i++)
+                    if (get_valid(i)) tmp.push_back(vals[i]);
+                pack_bits(tmp.data(), tmp.size(), cmin, bits, buf);
+                zm.has_min = true; zm.min_i64 = cmin;
+                zm.has_max = true; zm.max_i64 = cmax;
+            } else {
+                for (size_t i = 0; i < nrows; i++) {
+                    if (!get_valid(i)) continue;
+                    int32_t val = vals[i];
+                    wp(val);
+                    if (!zm.has_min || val < zm.min_i64) { zm.min_i64 = val; zm.has_min = true; }
+                    if (!zm.has_max || val > zm.max_i64) { zm.max_i64 = val; zm.has_max = true; }
+                }
+            }
+            break;
+        }
+        case ColumnType::I64: {
+            const int64_t* vals = reinterpret_cast<const int64_t*>(ca.data);
+            if (enc == Encoding::BIT_PACKED) {
+                int64_t cmin = INT64_MAX, cmax = INT64_MIN;
+                for (size_t i = 0; i < nrows; i++) {
+                    if (!get_valid(i)) continue;
+                    if (vals[i] < cmin) cmin = vals[i];
+                    if (vals[i] > cmax) cmax = vals[i];
+                }
+                uint64_t range = (uint64_t)(cmax - cmin);
+                uint8_t bits = range == 0 ? 1 : (uint8_t)(std::bit_width(range));
+                if (bits > 64) bits = 64;
+                wp(cmin);
+                wp(bits);
+                std::vector<int64_t> tmp;
+                tmp.reserve(nrows);
+                for (size_t i = 0; i < nrows; i++)
+                    if (get_valid(i)) tmp.push_back(vals[i]);
+                pack_bits(tmp.data(), tmp.size(), cmin, bits, buf);
+                zm.has_min = true; zm.min_i64 = cmin;
+                zm.has_max = true; zm.max_i64 = cmax;
+            } else {
+                for (size_t i = 0; i < nrows; i++) {
+                    if (!get_valid(i)) continue;
+                    int64_t val = vals[i];
+                    wp(val);
+                    if (!zm.has_min || val < zm.min_i64) { zm.min_i64 = val; zm.has_min = true; }
+                    if (!zm.has_max || val > zm.max_i64) { zm.max_i64 = val; zm.has_max = true; }
+                }
+            }
+            break;
+        }
+        case ColumnType::F32: {
+            const float* vals = reinterpret_cast<const float*>(ca.data);
+            for (size_t i = 0; i < nrows; i++) {
+                if (!get_valid(i)) continue;
+                float val = vals[i];
+                wp(val);
+                if (!zm.has_min || val < zm.min_f64) { zm.min_f64 = val; zm.has_min = true; }
+                if (!zm.has_max || val > zm.max_f64) { zm.max_f64 = val; zm.has_max = true; }
+            }
+            break;
+        }
+        case ColumnType::F64: {
+            const double* vals = reinterpret_cast<const double*>(ca.data);
+            for (size_t i = 0; i < nrows; i++) {
+                if (!get_valid(i)) continue;
+                double val = vals[i];
+                wp(val);
+                if (!zm.has_min || val < zm.min_f64) { zm.min_f64 = val; zm.has_min = true; }
+                if (!zm.has_max || val > zm.max_f64) { zm.max_f64 = val; zm.has_max = true; }
+            }
+            break;
+        }
+        case ColumnType::STRING: {
+            if (enc == Encoding::DICT) {
+                std::vector<std::string> dict;
+                std::unordered_map<std::string, uint32_t> dict_map;
+                std::vector<uint32_t> indices(nrows, UINT32_MAX);
+                const uint8_t* sptr = ca.data;
+
+                for (size_t i = 0; i < nrows; i++) {
+                    uint32_t slen;
+                    memcpy(&slen, sptr, 4); sptr += 4;
+                    if (get_valid(i)) {
+                        std::string s((const char*)sptr, slen);
+                        auto it = dict_map.find(s);
+                        uint32_t dict_idx;
+                        if (it == dict_map.end()) {
+                            dict_idx = (uint32_t)dict.size();
+                            dict_map[s] = dict_idx;
+                            dict.push_back(std::move(s));
+                        } else {
+                            dict_idx = it->second;
+                        }
+                        indices[i] = dict_idx;
+
+                        auto& zs = dict[dict_idx];
+                        if (!zm.has_min || zs < zm.min_str) { zm.min_str = zs; zm.has_min = true; }
+                        if (!zm.has_max || zs > zm.max_str) { zm.max_str = zs; zm.has_max = true; }
+                    }
+                    sptr += slen;
+                }
+                wp((uint32_t)dict.size());
+                for (auto& entry : dict) {
+                    wp((uint32_t)entry.size());
+                    w(entry.data(), entry.size());
+                }
+                uint8_t bits = dict.size() <= 1 ? 1 : (uint8_t)std::bit_width((uint64_t)dict.size() - 1);
+                wp(bits);
+                std::vector<int64_t> idx64(indices.begin(), indices.end());
+                std::vector<uint8_t> packed;
+                pack_bits(idx64.data(), idx64.size(), 0, bits, packed);
+                w(packed.data(), packed.size());
+            } else {
+                const uint8_t* sptr = ca.data;
+                for (size_t i = 0; i < nrows; i++) {
+                    uint32_t slen;
+                    memcpy(&slen, sptr, 4); sptr += 4;
+                    if (get_valid(i)) {
+                        wp(slen);
+                        w(sptr, slen);
+                        std::string s((const char*)sptr, slen);
+                        if (!zm.has_min || s < zm.min_str) { zm.min_str = s; zm.has_min = true; }
+                        if (!zm.has_max || s > zm.max_str) { zm.max_str = s; zm.has_max = true; }
+                    }
+                    sptr += slen;
+                }
+            }
+            break;
+        }
+        }
+        pages[ci].comp_size = (uint32_t)(buf.size() - pages[ci].offset);
+        pages[ci].crc = crc32c(buf.data() + pages[ci].offset, pages[ci].comp_size);
+    }
+
+    uint32_t dir_offset = (uint32_t)buf.size();
+    for (size_t ci = 0; ci < cols.size(); ci++) {
+        auto& pg = pages[ci];
+        wp((uint64_t)pg.offset);
+        wp(pg.comp_size);
+        wp(pg.comp_size);
+        wp(pg.crc);
+        wp((uint8_t)meta[ci].type);
+        wp((uint8_t)meta[ci].encoding);
+        wp((uint32_t)cols[ci].num_values);
+        wp(pg.validity_size);
+        wp((uint8_t)(pg.zm.has_min ? 1 : 0));
+        wp((uint8_t)(pg.zm.has_max ? 1 : 0));
+        wp(pg.zm.min_i64);
+        wp(pg.zm.max_i64);
+        wp(pg.zm.min_f64);
+        wp(pg.zm.max_f64);
+        wp((uint32_t)pg.zm.min_str.size());
+        w(pg.zm.min_str.data(), pg.zm.min_str.size());
+        wp((uint32_t)pg.zm.max_str.size());
+        w(pg.zm.max_str.data(), pg.zm.max_str.size());
+    }
+
+    memcpy(buf.data() + dir_off_pos, &dir_offset, 4);
+    uint32_t chunk_crc = crc32c(buf.data(), buf.size());
+    wp(chunk_crc);
+
+    uint32_t raw_size = (uint32_t)buf.size();
+
+    if (use_rs_) {
+        auto interleaved = rs_encode_interleaved(buf.data(), buf.size());
+        f.write(reinterpret_cast<const char*>(buf.data()), 4);
+        write_le<uint32_t>(f, raw_size);
+        f.write(reinterpret_cast<const char*>(interleaved.data()),
+                (std::streamsize)interleaved.size());
+    } else if (codec_ == Codec::LZ4) {
+        auto compressed = lz4_compress(buf.data(), buf.size());
+        uint32_t comp_size = (uint32_t)compressed.size();
+        f.write(reinterpret_cast<const char*>(buf.data()), 4);
+        write_le<uint32_t>(f, raw_size);
+        write_le<uint32_t>(f, comp_size);
+        f.write(reinterpret_cast<const char*>(compressed.data()),
+                (std::streamsize)compressed.size());
+    } else if (codec_ == Codec::ZSTD) {
+        auto compressed = zstd_compress(buf.data(), buf.size());
+        if (compressed.empty())
+            throw std::runtime_error("zepto: zstd compress failed");
+        uint32_t comp_size = (uint32_t)compressed.size();
+        f.write(reinterpret_cast<const char*>(buf.data()), 4);
+        write_le<uint32_t>(f, raw_size);
+        write_le<uint32_t>(f, comp_size);
+        f.write(reinterpret_cast<const char*>(compressed.data()),
+                (std::streamsize)compressed.size());
+    } else {
+        f.write(reinterpret_cast<const char*>(buf.data()), 4);
+        write_le<uint32_t>(f, raw_size);
+        write_le<uint32_t>(f, raw_size);
+        f.write(reinterpret_cast<const char*>(buf.data()), raw_size);
+    }
+
+    f.seekp(0);
+    auto fw = [&](const auto& v) { f.write(reinterpret_cast<const char*>(&v), sizeof(v)); };
+    fw(MAGIC);
+    fw((uint16_t)VERSION);
+    fw((uint16_t)meta.size());
+    fw((uint64_t)total_rows_);
+    fw((uint32_t)chunk_index_);
+    f.seekp(0, std::ios::end);
+}
+
+bool Writer::write_columns(const std::vector<WriteColArray>& cols, int num_rows) {
+    if (closed_) return false;
+    if (!metadata_written_) write_metadata();
+    if (cols.empty()) return false;
+    total_rows_ += num_rows;
+    uint32_t idx = chunk_index_++;
+    write_chunk_cols(cols, col_meta_, idx);
+    return true;
 }
 
 uint64_t Writer::flush_chunk() {
@@ -681,7 +1222,24 @@ bool Reader::read_header() {
     total_rows_ = read_le<uint64_t>(f);
     uint32_t num_chunks_hdr = read_le<uint32_t>(f);
     uint32_t meta_size = read_le<uint32_t>(f);
-    if (magic != MAGIC || version != VERSION) return false;
+    if (magic != MAGIC || (version != 2 && version != 3)) return false;
+
+    // VERSION 3 has an extra 4-byte flags field at offset 24
+    // VERSION 2: RS-ECC was always on
+    uint32_t file_flags = 0;
+    if (version == 3) {
+        file_flags = read_le<uint32_t>(f);
+    }
+    use_rs_ = (version == 2) ? true : ((file_flags & FLAG_RS_ECC) != 0);
+    if (version == 2) {
+        codec_ = Codec::NONE;
+    } else if (file_flags & FLAG_ZSTD) {
+        codec_ = Codec::ZSTD;
+    } else if (file_flags & FLAG_LZ4) {
+        codec_ = Codec::LZ4;
+    } else {
+        codec_ = Codec::NONE;
+    }
 
     if (meta_size > 0) {
         size_t meta_data_size = (size_t)meta_size - 4;
@@ -730,28 +1288,59 @@ bool Reader::read_chunk_meta(ChunkMeta& meta) {
     auto& f = impl_->file;
     meta.chunk_offset = f.tellg();
 
+    // Cap all allocations against the real file size so corrupt length
+    // fields can't trigger huge allocations.
+    f.seekg(0, std::ios::end);
+    auto fsize = (uint64_t)f.tellg();
+    f.seekg((std::streamoff)meta.chunk_offset);
+
     uint32_t magic = read_le<uint32_t>(f);
     if (magic != MAGIC) return false;
 
-    uint32_t orig_size = read_le<uint32_t>(f);
+    uint32_t raw_size = read_le<uint32_t>(f);
     if (!f) return false;
 
-    size_t nb = (orig_size + RS_BLOCK_K - 1) / RS_BLOCK_K;
-    size_t interleaved_len = nb * RS_TOTAL;
+    uint32_t comp_size;
+    size_t header_skip; // bytes already read after chunk offset
+    if (use_rs_) {
+        size_t nb = (raw_size + RS_BLOCK_K - 1) / RS_BLOCK_K;
+        comp_size = (uint32_t)(nb * RS_TOTAL);
+        header_skip = 8; // MAGIC(4) + raw_size(4)
+    } else {
+        comp_size = read_le<uint32_t>(f);
+        if (!f) return false;
+        header_skip = 12; // MAGIC(4) + raw_size(4) + comp_size(4)
+    }
 
-    std::vector<uint8_t> blob(interleaved_len);
-    f.read(reinterpret_cast<char*>(blob.data()), (std::streamsize)blob.size());
+    if (meta.chunk_offset + header_skip + (uint64_t)comp_size > fsize) return false;
+
+    // Read the chunk payload into a buffer
+    std::vector<uint8_t> payload(comp_size);
+    f.read(reinterpret_cast<char*>(payload.data()), (std::streamsize)comp_size);
     if (!f) return false;
 
-    // De-interleave into a temp buffer
-    size_t padded = nb * RS_BLOCK_K;
-    std::vector<uint8_t> raw(padded);
-    if (!rs_decode_interleaved(raw.data(), orig_size, blob.data(), blob.size()))
-        return false;
-    raw.resize(orig_size);
+    // Decode to raw chunk buffer
+    std::vector<uint8_t> raw;
+    if (use_rs_) {
+        size_t nb = (raw_size + RS_BLOCK_K - 1) / RS_BLOCK_K;
+        size_t padded = nb * RS_BLOCK_K;
+        raw.resize(padded);
+        if (!rs_decode_interleaved(raw.data(), raw_size, payload.data(), payload.size()))
+            return false;
+        raw.resize(raw_size);
+    } else if (codec_ == Codec::LZ4) {
+        raw = lz4_decompress(payload.data(), payload.size(), raw_size);
+        if (raw.size() != raw_size) return false;
+    } else if (codec_ == Codec::ZSTD) {
+        raw = zstd_decompress(payload.data(), payload.size(), raw_size);
+        if (raw.size() != raw_size) return false;
+    } else {
+        raw = std::move(payload);
+        if (raw_size > comp_size) return false;
+        raw.resize(raw_size);
+    }
 
-    // Parse raw buffer (same layout as old buf)
-    // [MAGIC(4)][chunk_index(2)][num_cols(2)][num_rows(4)][dir_offset(4)]
+    // Parse raw buffer
     if (raw.size() < 16) return false;
     memcpy(&magic, raw.data(), 4);
     if (magic != MAGIC) return false;
@@ -769,7 +1358,6 @@ bool Reader::read_chunk_meta(ChunkMeta& meta) {
 
     auto r32 = [&](size_t p) -> uint32_t { uint32_t v; memcpy(&v, raw.data() + p, 4); return v; };
     auto r64 = [&](size_t p) -> uint64_t { uint64_t v; memcpy(&v, raw.data() + p, 8); return v; };
-    (void)r64;
 
     size_t dp = dir_offset;
     for (uint16_t i = 0; i < num_cols; i++) {
@@ -803,7 +1391,7 @@ bool Reader::read_chunk_meta(ChunkMeta& meta) {
     }
     meta.num_pages = num_cols;
 
-    meta.chunk_size = (uint64_t)(8 + interleaved_len);
+    meta.chunk_size = header_skip + comp_size;
     f.seekg(meta.chunk_offset + (std::streamoff)meta.chunk_size);
     return true;
 }
@@ -820,71 +1408,115 @@ bool Reader::verify_integrity() {
     f.read(reinterpret_cast<char*>(buf.data()), size);
 
     auto r32 = [&](size_t p) -> uint32_t { uint32_t v; memcpy(&v, buf.data() + p, 4); return v; };
-    auto r16 = [&](size_t p) -> uint16_t { uint16_t v; memcpy(&v, buf.data() + p, 2); return v; };
 
     bool ok = true;
     uint32_t meta_size = r32(20);
-    size_t pos = 24 + meta_size;
+    size_t pos = 24 + (use_rs_ ? 0 : 4) + meta_size; // skip header + flags (v3 only) + meta
     if (pos >= (size_t)size) return false;
 
     while (pos + 8 <= (size_t)size) {
         size_t chunk_start = pos;
         if (r32(pos) != MAGIC) { ok = false; break; }
 
-        uint32_t orig_size = r32(pos + 4);
-        size_t nb = (orig_size + RS_BLOCK_K - 1) / RS_BLOCK_K;
-        size_t interleaved_len = nb * RS_TOTAL;
-        size_t chunk_end = pos + 8 + interleaved_len;
-        if (chunk_end > (size_t)size) { ok = false; break; }
+        uint32_t raw_size = r32(pos + 4);
+        std::vector<uint8_t> raw;
 
-        // Read interleaved blob, de-interleave, correct
-        size_t padded = nb * RS_BLOCK_K;
-        std::vector<uint8_t> raw(padded);
-        if (!rs_decode_interleaved(raw.data(), orig_size,
-                                    buf.data() + pos + 8, interleaved_len)) {
-            ok = false; break;
+        if (use_rs_) {
+            size_t nb = (raw_size + RS_BLOCK_K - 1) / RS_BLOCK_K;
+            size_t interleaved_len = nb * RS_TOTAL;
+            size_t chunk_end = pos + 8 + interleaved_len;
+            if (chunk_end > (size_t)size) { ok = false; break; }
+            size_t padded = nb * RS_BLOCK_K;
+            raw.resize(padded);
+            if (!rs_decode_interleaved(raw.data(), raw_size, buf.data() + pos + 8, interleaved_len)) {
+                ok = false; break;
+            }
+            raw.resize(raw_size);
+            pos = chunk_end;
+        } else {
+            if (pos + 12 > (size_t)size) { ok = false; break; }
+            uint32_t comp_size = r32(pos + 8);
+            size_t chunk_end = pos + 12 + comp_size;
+            if (chunk_end > (size_t)size) { ok = false; break; }
+            if (codec_ == Codec::LZ4) {
+                raw = lz4_decompress(buf.data() + pos + 12, comp_size, raw_size);
+                if (raw.size() != raw_size) { ok = false; break; }
+            } else if (codec_ == Codec::ZSTD) {
+                raw = zstd_decompress(buf.data() + pos + 12, comp_size, raw_size);
+                if (raw.size() != raw_size) { ok = false; break; }
+            } else {
+                raw.assign(buf.data() + pos + 12, buf.data() + pos + 12 + raw_size);
+            }
+            pos = chunk_end;
         }
-        raw.resize(orig_size);
 
-        // Verify CRC32C inside the de-interleaved raw data
         if (raw.size() < 16) { ok = false; break; }
         uint32_t stored_crc = 0;
         memcpy(&stored_crc, raw.data() + raw.size() - 4, 4);
         uint32_t calc_crc = crc32c(raw.data(), raw.size() - 4);
         if (calc_crc != stored_crc) { ok = false; break; }
-
-        pos = chunk_end;
     }
 
     f.seekg(orig);
     return ok;
 }
 
+std::vector<uint8_t> Reader::read_and_decode_chunk(size_t chunk_idx) {
+    std::vector<uint8_t> empty;
+    if (chunk_idx >= chunks_.size()) return empty;
+    auto& meta = chunks_[chunk_idx];
+    auto& f = impl_->file;
+
+    f.seekg(0, std::ios::end);
+    auto fsize = (uint64_t)f.tellg();
+    f.seekg(meta.chunk_offset);
+    uint32_t magic = read_le<uint32_t>(f);
+    if (magic != MAGIC) return empty;
+    uint32_t raw_size = read_le<uint32_t>(f);
+    if (!f) return empty;
+
+    if (use_rs_) {
+        size_t nb = (raw_size + RS_BLOCK_K - 1) / RS_BLOCK_K;
+        size_t interleaved_len = nb * RS_TOTAL;
+        if (meta.chunk_offset + 8 + interleaved_len > fsize) return empty;
+        std::vector<uint8_t> blob(interleaved_len);
+        f.read(reinterpret_cast<char*>(blob.data()), (std::streamsize)blob.size());
+        if (!f) return empty;
+        size_t padded = nb * RS_BLOCK_K;
+        std::vector<uint8_t> chunk_data(padded);
+        rs_decode_interleaved(chunk_data.data(), raw_size, blob.data(), blob.size());
+        chunk_data.resize(raw_size);
+        return chunk_data;
+    } else {
+        uint32_t comp_size = read_le<uint32_t>(f);
+        if (!f) return empty;
+        if (meta.chunk_offset + 12 + (uint64_t)comp_size > fsize) return empty;
+        std::vector<uint8_t> payload(comp_size);
+        f.read(reinterpret_cast<char*>(payload.data()), (std::streamsize)comp_size);
+        if (!f) return empty;
+        if (codec_ == Codec::LZ4) {
+            auto raw = lz4_decompress(payload.data(), payload.size(), raw_size);
+            if (raw.size() != raw_size) return empty;
+            return raw;
+        } else if (codec_ == Codec::ZSTD) {
+            auto raw = zstd_decompress(payload.data(), payload.size(), raw_size);
+            if (raw.size() != raw_size) return empty;
+            return raw;
+        } else {
+            if (raw_size > comp_size) return empty;
+            payload.resize(raw_size);
+            return payload;
+        }
+    }
+}
+
 std::vector<Row> Reader::read_chunk(size_t chunk_idx) {
     std::vector<Row> result;
     if (chunk_idx >= chunks_.size()) return result;
     auto& meta = chunks_[chunk_idx];
-    auto& f = impl_->file;
 
-    // Read interleaved blob and de-interleave
-    f.seekg(meta.chunk_offset);
-    uint32_t magic = read_le<uint32_t>(f);
-    if (magic != MAGIC) return result;
-    uint32_t orig_size = read_le<uint32_t>(f);
-    if (!f) return result;
-
-    size_t nb = (orig_size + RS_BLOCK_K - 1) / RS_BLOCK_K;
-    size_t interleaved_len = nb * RS_TOTAL;
-    std::vector<uint8_t> blob(interleaved_len);
-    f.read(reinterpret_cast<char*>(blob.data()), (std::streamsize)blob.size());
-    if (!f) return result;
-
-    size_t padded = nb * RS_BLOCK_K;
-    std::vector<uint8_t> chunk_data(padded);
-    rs_decode_interleaved(chunk_data.data(), orig_size, blob.data(), blob.size());
-    chunk_data.resize(orig_size);
-
-    if (chunk_data.size() < 16) return result;
+    auto chunk_data = read_and_decode_chunk(chunk_idx);
+    if (chunk_data.empty() || chunk_data.size() < 16) return result;
 
     // Parse directory from de-interleaved buffer
     uint32_t dir_offset = 0;
@@ -1071,16 +1703,18 @@ std::vector<Row> Reader::read_chunk(size_t chunk_idx) {
                     }
                     dict_read = true;
                 }
+                uint8_t bits = page_start[off++];
+                std::vector<int64_t> tmp(meta.num_rows);
+                unpack_bits(tmp.data(), meta.num_rows, 0, bits, page_start + off);
+                off += (meta.num_rows * (size_t)bits + 7) / 8;
                 for (size_t i = 0; i < meta.num_rows; i++) {
                     bool valid = validity.empty() || ((validity[i / 8] >> (i % 8)) & 1);
                     if (valid) {
-                        uint32_t di;
-                        memcpy(&di, page_start + off, 4); off += 4;
+                        uint32_t di = (uint32_t)tmp[i];
                         if (di < dict.size())
                             result[i].columns[ci] = dict[di];
                     } else {
                         result[i].columns[ci] = std::monostate{};
-                        off += 4; // skip index for null entry
                     }
                 }
             } else {
@@ -1097,6 +1731,218 @@ std::vector<Row> Reader::read_chunk(size_t chunk_idx) {
                 }
             }
             break;
+        }
+    }
+
+    return result;
+}
+
+std::vector<Reader::ColumnArray> Reader::read_chunk_cols(
+    size_t chunk_idx, const std::vector<size_t>& col_indices)
+{
+    std::vector<ColumnArray> result;
+    if (chunk_idx >= chunks_.size()) return result;
+    auto& meta = chunks_[chunk_idx];
+
+    auto chunk_data = read_and_decode_chunk(chunk_idx);
+    if (chunk_data.empty() || chunk_data.size() < 16) return result;
+
+    uint32_t dir_offset = 0;
+    memcpy(&dir_offset, chunk_data.data() + 12, 4);
+
+    struct PageDirEntry {
+        uint64_t offset;
+        uint32_t comp_size;
+        uint32_t crc;
+        ColumnType type;
+        Encoding encoding;
+        uint32_t num_vals;
+        uint32_t validity_size;
+    };
+
+    std::vector<PageDirEntry> dir;
+    size_t dp = dir_offset;
+    for (uint32_t i = 0; i < meta.num_pages; i++) {
+        PageDirEntry e{};
+        if (dp + 64 > chunk_data.size()) return result;
+        memcpy(&e.offset, chunk_data.data() + dp, 8); dp += 8;
+        memcpy(&e.comp_size, chunk_data.data() + dp, 4); dp += 4;
+        dp += 4;
+        memcpy(&e.crc, chunk_data.data() + dp, 4); dp += 4;
+        e.type = (ColumnType)chunk_data[dp++];
+        e.encoding = (Encoding)chunk_data[dp++];
+        memcpy(&e.num_vals, chunk_data.data() + dp, 4); dp += 4;
+        memcpy(&e.validity_size, chunk_data.data() + dp, 4); dp += 4;
+        dp += 2;
+        dp += 8;
+        dp += 8;
+        dp += 8;
+        dp += 8;
+        uint32_t slen;
+        memcpy(&slen, chunk_data.data() + dp, 4); dp += 4;
+        dp += slen;
+        memcpy(&slen, chunk_data.data() + dp, 4); dp += 4;
+        dp += slen;
+        dir.push_back(e);
+    }
+
+    uint32_t stored_crc = 0;
+    memcpy(&stored_crc, chunk_data.data() + chunk_data.size() - 4, 4);
+    uint32_t calc_crc = crc32c(chunk_data.data(), chunk_data.size() - 4);
+    if (calc_crc != stored_crc) return result;
+
+    result.resize(dir.size());
+
+    for (size_t ci = 0; ci < dir.size(); ci++) {
+        if (!col_indices.empty()) {
+            bool found = false;
+            for (auto idx : col_indices) { if (idx == ci) { found = true; break; } }
+            if (!found) continue;
+        }
+
+        auto& e = dir[ci];
+        auto& ca = result[ci];
+        ca.type = e.type;
+        ca.num_values = meta.num_rows;
+
+        if (e.offset + e.comp_size > chunk_data.size()) continue;
+        uint8_t* page_start = chunk_data.data() + e.offset;
+
+        uint32_t calc = crc32c(page_start, e.comp_size);
+        if (calc != e.crc) continue;
+
+        size_t off = 0;
+
+        if (e.validity_size > 0) {
+            ca.validity.assign(page_start, page_start + e.validity_size);
+            off += e.validity_size;
+        } else {
+            ca.validity.resize((meta.num_rows + 7) / 8, 0xFF);
+        }
+
+        auto get_valid = [&](size_t i) -> bool {
+            return ca.validity.empty() || ((ca.validity[i / 8] >> (i % 8)) & 1);
+        };
+
+        switch (e.type) {
+        case ColumnType::I32: {
+            ca.data.resize(meta.num_rows * sizeof(int32_t));
+            auto* dst = reinterpret_cast<int32_t*>(ca.data.data());
+            if (e.encoding == Encoding::BIT_PACKED) {
+                int32_t min_val;
+                memcpy(&min_val, page_start + off, 4); off += 4;
+                uint8_t bits = page_start[off++];
+                size_t non_null_count = 0;
+                for (size_t i = 0; i < meta.num_rows; i++)
+                    if (get_valid(i)) non_null_count++;
+                std::vector<int64_t> tmp(non_null_count);
+                unpack_bits(tmp.data(), non_null_count, min_val, bits, page_start + off);
+                size_t vi = 0;
+                for (size_t i = 0; i < meta.num_rows; i++)
+                    dst[i] = get_valid(i) ? (int32_t)tmp[vi++] : 0;
+            } else {
+                for (size_t i = 0; i < meta.num_rows; i++) {
+                    if (get_valid(i)) {
+                        memcpy(&dst[i], page_start + off, 4); off += 4;
+                    } else {
+                        dst[i] = 0;
+                    }
+                }
+            }
+            break;
+        }
+        case ColumnType::I64: {
+            ca.data.resize(meta.num_rows * sizeof(int64_t));
+            auto* dst = reinterpret_cast<int64_t*>(ca.data.data());
+            if (e.encoding == Encoding::BIT_PACKED) {
+                int64_t min_val;
+                memcpy(&min_val, page_start + off, 8); off += 8;
+                uint8_t bits = page_start[off++];
+                size_t non_null_count = 0;
+                for (size_t i = 0; i < meta.num_rows; i++)
+                    if (get_valid(i)) non_null_count++;
+                std::vector<int64_t> tmp(non_null_count);
+                unpack_bits(tmp.data(), non_null_count, min_val, bits, page_start + off);
+                size_t vi = 0;
+                for (size_t i = 0; i < meta.num_rows; i++)
+                    dst[i] = get_valid(i) ? tmp[vi++] : 0;
+            } else {
+                for (size_t i = 0; i < meta.num_rows; i++) {
+                    if (get_valid(i)) {
+                        memcpy(&dst[i], page_start + off, 8); off += 8;
+                    } else {
+                        dst[i] = 0;
+                    }
+                }
+            }
+            break;
+        }
+        case ColumnType::F32: {
+            ca.data.resize(meta.num_rows * sizeof(float));
+            auto* dst = reinterpret_cast<float*>(ca.data.data());
+            for (size_t i = 0; i < meta.num_rows; i++) {
+                if (get_valid(i)) {
+                    memcpy(&dst[i], page_start + off, 4); off += 4;
+                } else {
+                    dst[i] = 0;
+                }
+            }
+            break;
+        }
+        case ColumnType::F64: {
+            ca.data.resize(meta.num_rows * sizeof(double));
+            auto* dst = reinterpret_cast<double*>(ca.data.data());
+            for (size_t i = 0; i < meta.num_rows; i++) {
+                if (get_valid(i)) {
+                    memcpy(&dst[i], page_start + off, 8); off += 8;
+                } else {
+                    dst[i] = 0;
+                }
+            }
+            break;
+        }
+        case ColumnType::STRING: {
+            if (e.encoding == Encoding::DICT) {
+                uint32_t dict_size;
+                memcpy(&dict_size, page_start + off, 4); off += 4;
+                std::vector<std::string> dict(dict_size);
+                for (uint32_t di = 0; di < dict_size; di++) {
+                    uint32_t slen;
+                    memcpy(&slen, page_start + off, 4); off += 4;
+                    dict[di].assign((const char*)(page_start + off), slen);
+                    off += slen;
+                }
+                uint8_t bits = page_start[off++];
+                std::vector<int64_t> tmp(meta.num_rows);
+                unpack_bits(tmp.data(), meta.num_rows, 0, bits, page_start + off);
+                off += (meta.num_rows * (size_t)bits + 7) / 8;
+                for (size_t i = 0; i < meta.num_rows; i++) {
+                    if (get_valid(i) && (uint64_t)tmp[i] < dict.size()) {
+                        auto& s = dict[(uint32_t)tmp[i]];
+                        uint32_t slen = (uint32_t)s.size();
+                        ca.data.insert(ca.data.end(), reinterpret_cast<uint8_t*>(&slen), reinterpret_cast<uint8_t*>(&slen) + 4);
+                        ca.data.insert(ca.data.end(), s.begin(), s.end());
+                    } else {
+                        uint32_t slen = 0;
+                        ca.data.insert(ca.data.end(), reinterpret_cast<uint8_t*>(&slen), reinterpret_cast<uint8_t*>(&slen) + 4);
+                    }
+                }
+            } else {
+                for (size_t i = 0; i < meta.num_rows; i++) {
+                    if (get_valid(i)) {
+                        uint32_t slen;
+                        memcpy(&slen, page_start + off, 4); off += 4;
+                        ca.data.insert(ca.data.end(), reinterpret_cast<uint8_t*>(&slen), reinterpret_cast<uint8_t*>(&slen) + 4);
+                        ca.data.insert(ca.data.end(), page_start + off, page_start + off + slen);
+                        off += slen;
+                    } else {
+                        uint32_t slen = 0;
+                        ca.data.insert(ca.data.end(), reinterpret_cast<uint8_t*>(&slen), reinterpret_cast<uint8_t*>(&slen) + 4);
+                    }
+                }
+            }
+            break;
+        }
         }
     }
 
@@ -1148,6 +1994,25 @@ QueryResult Reader::query(const Query& q) {
             } else if (std::holds_alternative<double>(pred.value)) {
                 auto v = std::get<double>(pred.value);
                 if (!check(v, zm.min_f64, zm.max_f64)) { skip = true; break; }
+            } else if (std::holds_alternative<std::string>(pred.value)) {
+                auto& v = std::get<std::string>(pred.value);
+                if (zm.has_min && zm.has_max) {
+                    auto scheck = [&](const std::string& val, const std::string& mn, const std::string& mx) -> bool {
+                        switch (pred.op) {
+                        case Query::EQ: return val >= mn && val <= mx;
+                        case Query::NE: return true;
+                        case Query::GT: return mx > val;
+                        case Query::GE: return mx >= val;
+                        case Query::LT: return mn < val;
+                        case Query::LE: return mn <= val;
+                        default: return true;
+                        }
+                    };
+                    if (!scheck(v, zm.min_str, zm.max_str)) { skip = true; break; }
+                }
+            } else if (std::holds_alternative<int32_t>(pred.value)) {
+                auto v = (int64_t)std::get<int32_t>(pred.value);
+                if (!check(v, zm.min_i64, zm.max_i64)) { skip = true; break; }
             }
         }
         if (skip) continue;
@@ -1294,7 +2159,7 @@ Database::~Database() { close(); }
 bool Database::open(const std::string& dir) {
     dir_ = dir;
     wal_path_ = dir_ + "/wal";
-    current_path_ = dir_ + "/data.zepto";
+    current_path_ = dir_ + "/data.zdb";
     snap_dir_ = dir_ + "/snapshots";
 
     std::error_code ec;
@@ -1500,7 +2365,7 @@ bool Database::checkpoint() {
     std::string tmp = current_path_ + ".tmp";
 
     {
-        Writer wtr(tmp);
+        Writer wtr(tmp, DEFAULT_CHUNK_SIZE, false, Codec::NONE);
         for (size_t ci = 0; ci < schema_.size(); ci++) {
             wtr.add_column(schema_[ci].name, schema_[ci].type, schema_[ci].nullable, best_encs[ci]);
         }
@@ -1528,14 +2393,14 @@ bool Database::checkpoint() {
 bool Database::create_snapshot(const std::string& name) {
     if (!checkpoint()) return false;
 
-    std::string snap_path = snap_dir_ + "/" + name + ".zepto";
+    std::string snap_path = snap_dir_ + "/" + name + ".zdb";
     std::error_code ec;
     fs::copy_file(current_path_, snap_path, fs::copy_options::overwrite_existing, ec);
     return !ec;
 }
 
 bool Database::restore_snapshot(const std::string& name) {
-    std::string snap_path = snap_dir_ + "/" + name + ".zepto";
+    std::string snap_path = snap_dir_ + "/" + name + ".zdb";
 
     std::ifstream test(snap_path, std::ios::binary);
     if (!test) return false;
@@ -1657,17 +2522,20 @@ std::vector<std::string> Database::tokenize(const std::string& sql) {
 
 Value Database::parse_value(const std::string& s) {
     if (s == "null" || s == "NULL") return std::monostate{};
-    // try int first
-    char* end = nullptr;
-    long long iv = std::strtoll(s.c_str(), &end, 10);
-    if (end && *end == 0) {
-        if (iv >= INT32_MIN && iv <= INT32_MAX) return (int32_t)iv;
-        return (int64_t)iv;
+    // Empty token is a quoted '' literal, not a number.
+    if (!s.empty()) {
+        // try int first
+        char* end = nullptr;
+        long long iv = std::strtoll(s.c_str(), &end, 10);
+        if (end && *end == 0) {
+            if (iv >= INT32_MIN && iv <= INT32_MAX) return (int32_t)iv;
+            return (int64_t)iv;
+        }
+        // try float
+        end = nullptr;
+        double fv = std::strtod(s.c_str(), &end);
+        if (end && *end == 0) return (double)fv;
     }
-    // try float
-    end = nullptr;
-    double fv = std::strtod(s.c_str(), &end);
-    if (end && *end == 0) return (double)fv;
     // string
     return s;
 }
@@ -1861,7 +2729,50 @@ bool Database::exec(const std::string& sql) {
 
     if (cmd == "CREATE") { size_t p = 1; exec_create(tok, p); return true; }
     if (cmd == "INSERT") { size_t p = 1; exec_insert(tok, p); return true; }
-    if (cmd == "SELECT") { size_t p = 1; exec_select(tok, p); return true; }
+    if (cmd == "SELECT") {
+        // Capture cout to populate query result members
+        query_col_names_.clear();
+        query_col_types_.clear();
+        query_rows_.clear();
+        std::ostringstream capture;
+        auto* old = std::cout.rdbuf(capture.rdbuf());
+        size_t p = 1;
+        exec_select(tok, p);
+        std::cout.rdbuf(old);
+        // Parse captured output into structured results
+        std::istringstream iss(capture.str());
+        std::string line;
+        // Read header line
+        if (std::getline(iss, line)) {
+            std::istringstream hdr(line);
+            std::string col;
+            while (std::getline(hdr, col, '|')) {
+                // Trim whitespace
+                size_t s = col.find_first_not_of(" \t");
+                size_t e = col.find_last_not_of(" \t");
+                query_col_names_.push_back((s == std::string::npos) ? "" : col.substr(s, e - s + 1));
+                query_col_types_.push_back(ColumnType::STRING);
+            }
+        }
+        // Skip separator line (--- or ---+---)
+        if (std::getline(iss, line)) {}
+        // Read data rows until "(N row(s))" or EOF
+        while (std::getline(iss, line)) {
+            // Check for row count footer: "  (N row(s))"
+            if (line.find("row(s))") != std::string::npos) continue;
+            if (line.empty()) continue;
+            std::vector<std::string> row;
+            std::istringstream rds(line);
+            std::string val;
+            while (std::getline(rds, val, '|')) {
+                size_t s = val.find_first_not_of(" \t");
+                size_t e = val.find_last_not_of(" \t");
+                row.push_back((s == std::string::npos) ? "" : val.substr(s, e - s + 1));
+            }
+            if (!row.empty()) query_rows_.push_back(std::move(row));
+        }
+        return true;
+    }
     if (cmd == "UPDATE") { size_t p = 1; exec_update(tok, p); return true; }
     if (cmd == "DELETE") { size_t p = 1; exec_delete(tok, p); return true; }
     if (cmd == "DROP") { size_t p = 1; exec_drop(tok, p); return true; }
@@ -2025,7 +2936,16 @@ static Value coerce_value(const Value& v, ColumnType target) {
         using T = std::decay_t<decltype(x)>;
         if constexpr (std::is_same_v<T, std::string>) {
             if (target == ColumnType::STRING) return x;
-            return x;
+            if (x.empty()) return Value{}; // '' into a numeric column is unparseable -> NULL
+            // Parse the string as a number so it can live in a numeric column.
+            char* end = nullptr;
+            long long iv = std::strtoll(x.c_str(), &end, 10);
+            if (end && *end == 0)
+                return coerce_value((iv >= INT32_MIN && iv <= INT32_MAX) ? (int32_t)iv : (int64_t)iv, target);
+            end = nullptr;
+            double fv = std::strtod(x.c_str(), &end);
+            if (end && *end == 0) return coerce_value(fv, target);
+            return Value{}; // unparseable -> NULL
         } else if constexpr (std::is_arithmetic_v<T>) {
             double d = (double)x;
             switch (target) {
@@ -2033,10 +2953,13 @@ static Value coerce_value(const Value& v, ColumnType target) {
                 case ColumnType::I64: return (int64_t)d;
                 case ColumnType::F32: return (float)d;
                 case ColumnType::F64: return d;
-                default: return x;
+                case ColumnType::STRING:
+                    if constexpr (std::is_integral_v<T>) return std::to_string((long long)x);
+                    else return std::to_string(d);
+                default: return Value{};
             }
         } else {
-            return x;
+            return Value{};
         }
     }, v);
 }

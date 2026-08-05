@@ -3,8 +3,10 @@ CXXFLAGS  = -std=c++20 -O2
 SRC       = zepto.cpp
 CAPI_SRC  = zepto_capi.cpp
 
-TEST_SRCS = quick_test corrupt_test rs_test debug_test
-TOOL_SRCS = debug_raw debug_rows
+ZSTD_INC  = third_party/zstd
+
+TEST_SRCS = quick_test corrupt_test rs_test lz4_test
+TOOL_SRCS = zcli
 ALL_EXES  = zepto $(TEST_SRCS) $(TOOL_SRCS)
 
 # ---- Platform detection via compiler (works across all OS / process bitness) ----
@@ -23,6 +25,8 @@ ifneq ($(UNAME_S),)
   RMDIR      = rm -rf
   PYTHON     = python3
   EXE_EXT    =
+  ZSTD_LIB   = -lzstd
+  ZSTD_COPY  = @true
   ifeq ($(UNAME_S),Darwin)
     DLL_EXT  = .dylib
   else
@@ -31,12 +35,16 @@ ifneq ($(UNAME_S),)
 else
   # Windows (MinGW / MSYS / Cygwin)
   DLL_EXT    = .dll
-  DLL_LINK   = -shared -static
+  DLL_LINK   = -shared
   DELFILE    = del /f /q
   RMDIR      = cmd /c rd /s /q
   PYTHON     = python
   EXE_EXT    = .exe
+  ZSTD_LIB   = -L$(ZSTD_INC) -lzstd
+  ZSTD_COPY  = $(PYTHON) -c "import shutil;shutil.copyfile('third_party/zstd/libzstd.dll','libzstd.dll')"
 endif
+
+CXXFLAGS += -I$(ZSTD_INC)
 
 .PHONY: all lib repl python test tools clean
 
@@ -47,8 +55,10 @@ lib: zepto.o
 repl: zepto$(EXE_EXT)
 
 python: zepto$(DLL_EXT)
+	@$(ZSTD_COPY)
 
 test: $(addsuffix $(EXE_EXT),$(TEST_SRCS))
+	@$(ZSTD_COPY)
 	@echo "--- Running all tests ---"
 	@$(word 1,$(TEST_SRCS))$(EXE_EXT)
 	@$(word 2,$(TEST_SRCS))$(EXE_EXT)
@@ -57,39 +67,37 @@ test: $(addsuffix $(EXE_EXT),$(TEST_SRCS))
 	@echo "  All tests passed."
 
 tools: $(addsuffix $(EXE_EXT),$(TOOL_SRCS))
+	@$(ZSTD_COPY)
 
 zepto$(EXE_EXT): $(SRC) zepto.h
-	$(CXX) $(CXXFLAGS) -DZEPTO_REPL $(SRC) -o $@
+	$(CXX) $(CXXFLAGS) -DZEPTO_REPL $(SRC) -o $@ $(ZSTD_LIB)
 
 zepto.o: $(SRC) zepto.h
 	$(CXX) $(CXXFLAGS) -c $(SRC) -o $@
 
 zepto$(DLL_EXT): $(SRC) $(CAPI_SRC) zepto_capi.h zepto.h
-	$(CXX) $(CXXFLAGS) $(DLL_LINK) -o $@ $(SRC) $(CAPI_SRC)
+	$(CXX) $(CXXFLAGS) $(DLL_LINK) -o $@ $(SRC) $(CAPI_SRC) $(ZSTD_LIB)
 
 # ---- Test executables ----
 quick_test$(EXE_EXT): quick_test.cpp $(SRC) zepto.h
-	$(CXX) $(CXXFLAGS) -o $@ quick_test.cpp $(SRC)
+	$(CXX) $(CXXFLAGS) -o $@ quick_test.cpp $(SRC) $(ZSTD_LIB)
 
 corrupt_test$(EXE_EXT): corrupt_test.cpp $(SRC) zepto.h
-	$(CXX) $(CXXFLAGS) -o $@ corrupt_test.cpp $(SRC)
+	$(CXX) $(CXXFLAGS) -o $@ corrupt_test.cpp $(SRC) $(ZSTD_LIB)
 
 rs_test$(EXE_EXT): rs_test.cpp $(SRC) zepto.h
-	$(CXX) $(CXXFLAGS) -o $@ rs_test.cpp $(SRC)
+	$(CXX) $(CXXFLAGS) -o $@ rs_test.cpp $(SRC) $(ZSTD_LIB)
 
-debug_test$(EXE_EXT): debug_test.cpp $(SRC) zepto.h
-	$(CXX) $(CXXFLAGS) -o $@ debug_test.cpp $(SRC)
+lz4_test$(EXE_EXT): lz4_test.cpp $(SRC) zepto.h
+	$(CXX) $(CXXFLAGS) -o $@ lz4_test.cpp $(SRC) $(ZSTD_LIB)
 
 # ---- Tool executables ----
-debug_raw$(EXE_EXT): debug_raw.cpp $(SRC) zepto.h
-	$(CXX) $(CXXFLAGS) -o $@ debug_raw.cpp $(SRC)
-
-debug_rows$(EXE_EXT): debug_rows.cpp $(SRC) zepto.h
-	$(CXX) $(CXXFLAGS) -o $@ debug_rows.cpp $(SRC)
+zcli$(EXE_EXT): zcli.cpp $(SRC) zepto.h
+	$(CXX) $(CXXFLAGS) -o $@ zcli.cpp $(SRC) $(ZSTD_LIB)
 
 clean:
 	-$(DELFILE) *.o *.exe *.dll *.dylib *.so
-	-$(DELFILE) *.zepto
+	-$(DELFILE) *.zdb
 	-$(RMDIR) test_features_dir
 	-$(RMDIR) test_features2
 	-$(RMDIR) test_features3

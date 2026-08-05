@@ -27,6 +27,7 @@ Thumbs.db
 
 # --- Test data (all generated at runtime) ---
 *.zepto
+*.zdb
 __pycache__/
 zepto/
 uhhhrandomcrap.txt
