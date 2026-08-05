@@ -12,7 +12,7 @@
 namespace zepto {
 
 constexpr uint32_t MAGIC = 0x5450455A; // "ZEPT" little-endian
-constexpr uint16_t VERSION = 3;
+constexpr uint16_t VERSION = 4;
 constexpr size_t DEFAULT_CHUNK_SIZE = 64 * 1024 * 1024; // 64MB
 
 // File-level flags (stored in header flags field, 4 bytes at offset 24)
@@ -35,6 +35,7 @@ enum class Encoding : uint8_t {
     DICT = 1,
     BIT_PACKED = 2,
     DELTA = 3,
+    RLE = 4,
 };
 
 // Compression codec applied to each chunk (stored in file header flags)
@@ -227,6 +228,7 @@ private:
     bool opened_ = false;
     bool use_rs_ = false;
     Codec codec_ = Codec::NONE;
+    uint16_t file_version_ = 0;
 
     bool read_header();
     bool read_chunk_meta(ChunkMeta& meta);

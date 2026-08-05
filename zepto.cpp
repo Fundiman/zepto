@@ -11,6 +11,8 @@
 #include <set>
 #include <map>
 #include <unordered_map>
+#include <thread>
+#include <atomic>
 #include <zstd.h>
 namespace fs = std::filesystem;
 
@@ -167,6 +169,135 @@ static std::vector<uint8_t> zstd_decompress(const uint8_t* src, size_t src_size,
     return out;
 }
 
+// ---- VERSION 4 segmented compression ----
+//
+// Compressed chunks (codec != NONE) are split into ~1MB segments, each
+// compressed independently as its own frame on a worker thread. The on-disk
+// container after the MAGIC(4)+raw_size(4)+comp_size(4) header is:
+//
+//   nseg(2) + [seg_raw(4) + seg_comp(4)] * nseg + frames...
+//
+// where comp_size = 2 + 8*nseg + sum(seg_comp). The reader reassembles the
+// raw chunk buffer by decompressing the segments (also in parallel).
+
+static constexpr size_t SEGMENT_SIZE = 1 << 20; // 1MB per frame
+static constexpr size_t MAX_SEGMENTS = 64;
+
+static size_t segment_count(size_t raw_size) {
+    size_t nseg = (raw_size + SEGMENT_SIZE - 1) / SEGMENT_SIZE;
+    if (nseg == 0) nseg = 1;
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw > 0) nseg = std::min(nseg, (size_t)hw);
+    return std::max<size_t>(1, std::min(nseg, MAX_SEGMENTS));
+}
+
+static bool compress_frame(Codec codec, const uint8_t* src, size_t src_size,
+                           std::vector<uint8_t>& out) {
+    if (codec == Codec::ZSTD) {
+        out = zstd_compress(src, src_size);
+        return !out.empty();
+    }
+    out = lz4_compress(src, src_size);
+    return !out.empty();
+}
+
+static bool decompress_frame(Codec codec, const uint8_t* src, size_t src_size,
+                             size_t raw_size, std::vector<uint8_t>& out) {
+    if (codec == Codec::ZSTD) {
+        out = zstd_decompress(src, src_size, raw_size);
+    } else {
+        out = lz4_decompress(src, src_size, raw_size);
+    }
+    return out.size() == raw_size;
+}
+
+// Compress src into the segmented V4 payload (table + frames). Returns empty
+// vector on failure. Codec must be LZ4 or ZSTD.
+static std::vector<uint8_t> segmented_compress(const uint8_t* src, size_t src_size, Codec codec) {
+    size_t nseg = segment_count(src_size);
+    std::vector<size_t> offsets(nseg);
+    for (size_t i = 0; i < nseg; i++)
+        offsets[i] = std::min(src_size, i * SEGMENT_SIZE);
+
+    std::vector<std::vector<uint8_t>> frames(nseg);
+    std::vector<std::thread> threads;
+    threads.reserve(nseg);
+    for (size_t i = 0; i < nseg; i++) {
+        size_t begin = offsets[i];
+        size_t end = (i + 1 < nseg) ? offsets[i + 1] : src_size;
+        threads.emplace_back([&, i, begin, end] {
+            compress_frame(codec, src + begin, end - begin, frames[i]);
+        });
+    }
+    for (auto& t : threads) t.join();
+    for (auto& f : frames)
+        if (f.empty()) return {};
+
+    std::vector<uint8_t> payload;
+    payload.reserve(2 + 8 * nseg + src_size);
+    auto push16 = [&](uint16_t v) { payload.push_back((uint8_t)v); payload.push_back((uint8_t)(v >> 8)); };
+    auto push32 = [&](uint32_t v) {
+        payload.push_back((uint8_t)v); payload.push_back((uint8_t)(v >> 8));
+        payload.push_back((uint8_t)(v >> 16)); payload.push_back((uint8_t)(v >> 24));
+    };
+    push16((uint16_t)nseg);
+    for (size_t i = 0; i < nseg; i++) {
+        size_t begin = offsets[i];
+        size_t end = (i + 1 < nseg) ? offsets[i + 1] : src_size;
+        push32((uint32_t)(end - begin));
+        push32((uint32_t)frames[i].size());
+    }
+    for (auto& f : frames) payload.insert(payload.end(), f.begin(), f.end());
+    return payload;
+}
+
+// Parse the segmented V4 payload and reassemble the raw chunk buffer into out.
+// Returns false on malformed payload or decode failure.
+static bool segmented_decompress(const uint8_t* payload, size_t payload_size,
+                                 size_t raw_size, Codec codec, std::vector<uint8_t>& out) {
+    if (payload_size < 2) return false;
+    size_t nseg = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+    if (nseg == 0 || nseg > MAX_SEGMENTS) return false;
+    if (payload_size < 2 + 8 * nseg) return false;
+
+    std::vector<size_t> raw_sizes(nseg), comp_sizes(nseg);
+    size_t frames_begin = 2 + 8 * nseg;
+    size_t total_raw = 0, cursor = frames_begin;
+    for (size_t i = 0; i < nseg; i++) {
+        size_t p = 2 + 8 * i;
+        raw_sizes[i] = (size_t)payload[p] | ((size_t)payload[p + 1] << 8) |
+                       ((size_t)payload[p + 2] << 16) | ((size_t)payload[p + 3] << 24);
+        comp_sizes[i] = (size_t)payload[p + 4] | ((size_t)payload[p + 5] << 8) |
+                        ((size_t)payload[p + 6] << 16) | ((size_t)payload[p + 7] << 24);
+        total_raw += raw_sizes[i];
+        cursor += comp_sizes[i];
+    }
+    if (total_raw != raw_size || cursor != payload_size) return false;
+
+    std::vector<std::vector<uint8_t>> frames(nseg);
+    std::vector<std::thread> threads;
+    threads.reserve(nseg);
+    cursor = frames_begin;
+    for (size_t i = 0; i < nseg; i++) {
+        size_t begin = cursor;
+        size_t end = cursor + comp_sizes[i];
+        cursor = end;
+        threads.emplace_back([&, i, begin, end] {
+            decompress_frame(codec, payload + begin, end - begin, raw_sizes[i], frames[i]);
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    out.clear();
+    out.reserve(raw_size);
+    for (size_t i = 0; i < nseg; i++) {
+        if (frames[i].size() != raw_sizes[i]) return false;
+        out.insert(out.end(), frames[i].begin(), frames[i].end());
+    }
+    return out.size() == raw_size;
+}
+
+
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 static bool has_sse42() {
@@ -275,6 +406,246 @@ static void unpack_bits(int64_t* values, size_t n, int64_t min_val, uint8_t bits
         bits_in_buf -= bits;
     }
 }
+
+static bool unpack_bits_checked(int64_t* values, size_t n, int64_t min_val,
+                                uint8_t bits, const uint8_t* data, size_t data_len) {
+    if (bits == 0 || bits > 64) return false;
+    size_t need_bytes = (n * bits + 7) / 8;
+    if (need_bytes > data_len) return false;
+    unpack_bits(values, n, min_val, bits, data);
+    return true;
+}
+
+// ---- DELTA pattern encoding (VERSION 4) ----
+//
+// Monotonic integer columns (non-decreasing or non-increasing over the valid
+// values) are stored as: [direction(1)] [first_value(width)] [bits(1)]
+// [packed deltas LSB-first, delta_0 = 0]. Deltas are magnitudes computed with
+// modular (uint64) arithmetic so they are exact even when the value span
+// crosses the int64 sign boundary.
+
+struct DeltaInfo {
+    bool monotonic = false;
+    uint8_t dir = 1;        // 1 = non-decreasing, 0 = non-increasing
+    uint8_t bits = 0;       // bit width of the largest delta magnitude
+    uint64_t max_delta = 0;
+    uint64_t range = 0;     // span of valid values (uint64)
+};
+
+// vals: the valid (non-null) values, first_val_width is 4 for I32 / 8 for I64.
+static DeltaInfo delta_analyze(const int64_t* vals, size_t n) {
+    DeltaInfo info;
+    if (n < 2) return info;
+    bool inc = true, dec = true;
+    uint64_t lo = (uint64_t)vals[0], hi = (uint64_t)vals[0];
+    uint64_t prev = (uint64_t)vals[0];
+    uint64_t max_d = 0;
+    for (size_t i = 1; i < n; i++) {
+        uint64_t cur = (uint64_t)vals[i];
+        if (vals[i] < vals[i - 1]) inc = false;
+        if (vals[i] > vals[i - 1]) dec = false;
+        if (cur < lo) lo = cur;
+        if (cur > hi) hi = cur;
+        uint64_t d = (vals[i] >= vals[i - 1]) ? (cur - prev) : (prev - cur);
+        if (d > max_d) max_d = d;
+        prev = cur;
+    }
+    if (!inc && !dec) return info;
+    info.monotonic = true;
+    info.dir = inc ? 1 : 0;
+    info.max_delta = max_d;
+    info.range = hi - lo;
+    info.bits = max_d == 0 ? 1 : (uint8_t)std::bit_width(max_d);
+    return info;
+}
+
+// Encode monotonic values into dst. returns false if not monotonic.
+static bool delta_encode(const int64_t* vals, size_t n, size_t first_width,
+                         const DeltaInfo& info, std::vector<uint8_t>& dst) {
+    if (!info.monotonic || n < 2) return false;
+    dst.push_back(info.dir);
+    uint64_t first = (uint64_t)vals[0];
+    for (size_t i = 0; i < first_width; i++)
+        dst.push_back((uint8_t)(first >> (8 * i)));
+    dst.push_back(info.bits);
+    std::vector<int64_t> deltas(n);
+    deltas[0] = 0;
+    for (size_t i = 1; i < n; i++) {
+        uint64_t cur = (uint64_t)vals[i], prev = (uint64_t)vals[i - 1];
+        uint64_t d = info.dir == 1 ? (cur - prev) : (prev - cur);
+        deltas[i] = (int64_t)d;
+    }
+    pack_bits(deltas.data(), n, 0, info.bits, dst);
+    return true;
+}
+
+// Decode a DELTA page: [dir(1)] [first_value(width)] [bits(1)] [packed deltas].
+// On malformed input returns false.
+static bool delta_decode(const uint8_t* src, size_t src_len, size_t first_width,
+                         size_t n, std::vector<int64_t>& out) {
+    size_t need = 2 + first_width;
+    if (src_len < need) return false;
+    uint8_t dir = src[0];
+    if (dir > 1) return false;
+    uint64_t first = 0;
+    for (size_t i = 0; i < first_width; i++)
+        first |= (uint64_t)src[1 + i] << (8 * i);
+    uint8_t bits = src[1 + first_width];
+    if (bits > 64) return false;
+    out.resize(n);
+    std::vector<int64_t> deltas(n);
+    if (!unpack_bits_checked(deltas.data(), n, 0, bits, src + need, src_len - need))
+        return false;
+    uint64_t cur = first;
+    out[0] = (int64_t)cur;
+    for (size_t i = 1; i < n; i++) {
+        uint64_t d = (uint64_t)deltas[i];
+        cur = dir == 1 ? (cur + d) : (cur - d);
+        out[i] = (int64_t)cur;
+    }
+    return true;
+}
+
+// ---- RLE encoding (VERSION 4) ----
+//
+// Runs of equal valid integer values are stored as:
+// [num_runs(4)] then per run: [value(width)] [run_len(4)].
+// Chosen only when the number of runs is small enough to beat the
+// alternative (PLAIN / BIT_PACKED / DELTA).
+
+struct RleInfo {
+    uint32_t num_runs = 0;
+    uint64_t max_run = 0;
+};
+
+static RleInfo rle_analyze(const int64_t* vals, size_t n) {
+    RleInfo info;
+    if (n == 0) return info;
+    info.num_runs = 1;
+    uint64_t run = 1;
+    for (size_t i = 1; i < n; i++) {
+        if (vals[i] == vals[i - 1]) {
+            run++;
+        } else {
+            if (run > info.max_run) info.max_run = run;
+            run = 1;
+            info.num_runs++;
+        }
+    }
+    if (run > info.max_run) info.max_run = run;
+    return info;
+}
+
+static bool rle_encode(const int64_t* vals, size_t n, size_t width,
+                       const RleInfo& info, std::vector<uint8_t>& dst) {
+    if (n == 0 || info.num_runs == 0) return false;
+    uint32_t runs = info.num_runs;
+    for (size_t i = 0; i < 4; i++) dst.push_back((uint8_t)(runs >> (8 * i)));
+    size_t i = 0;
+    while (i < n) {
+        uint64_t val = (uint64_t)vals[i];
+        size_t j = i;
+        while (j < n && vals[j] == vals[i]) j++;
+        uint32_t len = (uint32_t)(j - i);
+        for (size_t k = 0; k < width; k++)
+            dst.push_back((uint8_t)(val >> (8 * k)));
+        for (size_t k = 0; k < 4; k++)
+            dst.push_back((uint8_t)(len >> (8 * k)));
+        i = j;
+    }
+    return true;
+}
+
+// Decode an RLE page: [num_runs(4)] then per run [value(width)] [run_len(4)].
+// On malformed input (runs not summing to n) returns false.
+static bool rle_decode(const uint8_t* src, size_t src_len, size_t width,
+                       size_t n, std::vector<int64_t>& out) {
+    if (src_len < 4) return false;
+    uint32_t runs;
+    memcpy(&runs, src, 4);
+    out.clear();
+    out.reserve(n);
+    size_t off = 4;
+    for (uint32_t r = 0; r < runs; r++) {
+        if (off + width + 4 > src_len) return false;
+        uint64_t val = 0;
+        for (size_t k = 0; k < width; k++)
+            val |= (uint64_t)src[off + k] << (8 * k);
+        off += width;
+        uint32_t len;
+        memcpy(&len, src + off, 4);
+        off += 4;
+        if (len == 0 || out.size() + len > n) return false;
+        for (uint32_t k = 0; k < len; k++)
+            out.push_back((int64_t)val);
+    }
+    return out.size() == n;
+}
+
+// Encode a page of valid integer values into out, choosing the best of
+// PLAIN / BIT_PACKED / DELTA / RLE based on estimated byte size. width is 4
+// (I32) or 8 (I64). range_bits is the bit width of the value span (already
+// clamped to the column width). Returns the encoding actually used.
+static Encoding encode_int_page(const int64_t* vals, size_t n, size_t width,
+                                uint8_t range_bits, Encoding requested,
+                                std::vector<uint8_t>& out) {
+    if (n == 0) return Encoding::PLAIN;
+    size_t bp_bits = range_bits;
+    if (width == 4 && bp_bits > 32) bp_bits = 32;
+    if (width == 8 && bp_bits > 64) bp_bits = 64;
+
+    // Candidate byte sizes; requested encoding is the floor (BIT_PACKED or PLAIN).
+    Encoding best = requested == Encoding::BIT_PACKED ? Encoding::BIT_PACKED : Encoding::PLAIN;
+    size_t best_size;
+    if (best == Encoding::BIT_PACKED) {
+        best_size = width + 1 + (n * bp_bits + 7) / 8;
+    } else {
+        best_size = n * width;
+    }
+
+    // DELTA / RLE are automatic upgrades on top of BIT_PACKED / PLAIN only.
+    DeltaInfo di{};
+    RleInfo ri{};
+    if (requested == Encoding::BIT_PACKED || requested == Encoding::PLAIN) {
+        di = delta_analyze(vals, n);
+        if (di.monotonic && di.max_delta > 0) {
+            size_t dsize = 1 + width + 1 + (n * di.bits + 7) / 8;
+            if (dsize < best_size) { best = Encoding::DELTA; best_size = dsize; }
+        }
+
+        ri = rle_analyze(vals, n);
+        if (ri.num_runs < n) {
+            size_t rsize = 4 + (size_t)ri.num_runs * (width + 4);
+            if (rsize < best_size) { best = Encoding::RLE; best_size = rsize; }
+        }
+    }
+
+    if (best == Encoding::DELTA) {
+        delta_encode(vals, n, width, di, out);
+        return best;
+    }
+    if (best == Encoding::RLE) {
+        rle_encode(vals, n, width, ri, out);
+        return best;
+    }
+    if (best == Encoding::BIT_PACKED) {
+        int64_t cmin = vals[0];
+        for (size_t i = 1; i < n; i++) if (vals[i] < cmin) cmin = vals[i];
+        for (size_t k = 0; k < width; k++)
+            out.push_back((uint8_t)((uint64_t)cmin >> (8 * k)));
+        out.push_back((uint8_t)bp_bits);
+        pack_bits(vals, n, cmin, bp_bits, out);
+        return best;
+    }
+    // PLAIN
+    for (size_t i = 0; i < n; i++) {
+        uint64_t v = (uint64_t)vals[i];
+        for (size_t k = 0; k < width; k++)
+            out.push_back((uint8_t)(v >> (8 * k)));
+    }
+    return Encoding::PLAIN;
+}
+
 
 // ---- Reed-Solomon Error Correction (GF(256), QR-code style) ----
 
@@ -647,8 +1018,9 @@ void Writer::write_chunk(const std::vector<std::vector<Value>>& cols,
     };
     auto wp = [&](const auto& v) { w(&v, sizeof(v)); };
 
-    struct PageInfo { uint64_t offset; uint32_t comp_size, crc; ZoneMap zm; uint32_t validity_size; };
+    struct PageInfo { uint64_t offset; uint32_t comp_size, crc; ZoneMap zm; uint32_t validity_size; Encoding encoding; };
     std::vector<PageInfo> pages(cols.size());
+    std::vector<std::vector<uint8_t>> page_bufs(cols.size());
 
     wp(MAGIC);
     wp((uint16_t)idx);
@@ -657,7 +1029,7 @@ void Writer::write_chunk(const std::vector<std::vector<Value>>& cols,
     size_t dir_off_pos = buf.size();
     wp((uint32_t)0);
 
-    auto write_validity = [&](const std::vector<Value>& col_data) -> std::vector<uint8_t> {
+    auto write_validity = [](const std::vector<Value>& col_data) -> std::vector<uint8_t> {
         std::vector<uint8_t> bm;
         if (col_data.empty()) return bm;
         size_t n = col_data.size();
@@ -670,151 +1042,157 @@ void Writer::write_chunk(const std::vector<std::vector<Value>>& cols,
         return bm;
     };
 
+    // Encode each column page in parallel; every thread only touches its own
+    // page buffer and PageInfo, and reads the shared variant columns (const).
+    std::atomic<size_t> next_col{0};
+    unsigned hw = std::thread::hardware_concurrency();
+    size_t nthreads = cols.empty() ? 1 : std::min(cols.size(), (size_t)(hw ? hw : 1));
+    std::vector<std::thread> threads;
+    threads.reserve(nthreads);
+    for (size_t t = 0; t < nthreads; t++) {
+        threads.emplace_back([&] {
+            for (;;) {
+                size_t ci = next_col.fetch_add(1);
+                if (ci >= cols.size()) break;
+
+                auto& page = page_bufs[ci];
+                auto& pg = pages[ci];
+                auto& col_data = cols[ci];
+                ZoneMap& zm = pg.zm;
+                Encoding enc = meta[ci].encoding;
+                bool nullable = meta[ci].nullable;
+
+                auto w = [&](const void* d, size_t n) {
+                    auto* p = static_cast<const uint8_t*>(d);
+                    page.insert(page.end(), p, p + n);
+                };
+                auto wp = [&](const auto& v) { w(&v, sizeof(v)); };
+
+                if (nullable) {
+                    auto validity = write_validity(col_data);
+                    pg.validity_size = (uint32_t)validity.size();
+                    w(validity.data(), validity.size());
+                } else {
+                    pg.validity_size = 0;
+                }
+
+                switch (meta[ci].type) {
+                case ColumnType::I32: {
+                    std::vector<int64_t> tmp;
+                    tmp.reserve(col_data.size());
+                    int32_t cmin = INT32_MAX, cmax = INT32_MIN;
+                    for (auto& v : col_data) {
+                        if (is_null(v)) continue;
+                        int32_t val = std::get<int32_t>(v);
+                        tmp.push_back(val);
+                        if (val < cmin) cmin = val;
+                        if (val > cmax) cmax = val;
+                    }
+                    uint64_t span = (uint64_t)cmax - (uint64_t)cmin;
+                    uint8_t range_bits = span == 0 ? 1 : (uint8_t)std::bit_width(span);
+
+                    std::vector<uint8_t> val_bytes;
+                    enc = encode_int_page(tmp.data(), tmp.size(), 4, range_bits, enc, val_bytes);
+                    w(val_bytes.data(), val_bytes.size());
+                    zm.has_min = true; zm.min_i64 = cmin;
+                    zm.has_max = true; zm.max_i64 = cmax;
+                    break;
+                }
+                case ColumnType::I64: {
+                    std::vector<int64_t> tmp;
+                    tmp.reserve(col_data.size());
+                    int64_t cmin = INT64_MAX, cmax = INT64_MIN;
+                    for (auto& v : col_data) {
+                        if (is_null(v)) continue;
+                        int64_t val = std::get<int64_t>(v);
+                        tmp.push_back(val);
+                        if (val < cmin) cmin = val;
+                        if (val > cmax) cmax = val;
+                    }
+                    uint64_t span = (uint64_t)cmax - (uint64_t)cmin;
+                    uint8_t range_bits = span == 0 ? 1 : (uint8_t)std::bit_width(span);
+
+                    std::vector<uint8_t> val_bytes;
+                    enc = encode_int_page(tmp.data(), tmp.size(), 8, range_bits, enc, val_bytes);
+                    w(val_bytes.data(), val_bytes.size());
+                    zm.has_min = true; zm.min_i64 = cmin;
+                    zm.has_max = true; zm.max_i64 = cmax;
+                    break;
+                }
+                case ColumnType::F32:
+                    for (auto& v : col_data) {
+                        if (is_null(v)) continue;
+                        float val = std::get<float>(v);
+                        wp(val);
+                        if (!zm.has_min || val < zm.min_f64) { zm.min_f64 = val; zm.has_min = true; }
+                        if (!zm.has_max || val > zm.max_f64) { zm.max_f64 = val; zm.has_max = true; }
+                    }
+                    break;
+                case ColumnType::F64:
+                    for (auto& v : col_data) {
+                        if (is_null(v)) continue;
+                        double val = std::get<double>(v);
+                        wp(val);
+                        if (!zm.has_min || val < zm.min_f64) { zm.min_f64 = val; zm.has_min = true; }
+                        if (!zm.has_max || val > zm.max_f64) { zm.max_f64 = val; zm.has_max = true; }
+                    }
+                    break;
+                case ColumnType::STRING:
+                    if (enc == Encoding::DICT) {
+                        std::vector<std::string> dict;
+                        std::unordered_map<std::string, uint32_t> dict_map;
+                        std::vector<uint32_t> indices;
+                        indices.reserve(col_data.size());
+                        for (auto& v : col_data) {
+                            if (is_null(v)) { indices.push_back(UINT32_MAX); continue; }
+                            const auto& s = std::get<std::string>(v);
+                            auto it = dict_map.find(s);
+                            uint32_t idx;
+                            if (it == dict_map.end()) {
+                                idx = (uint32_t)dict.size();
+                                dict_map[s] = idx;
+                                dict.push_back(s);
+                            } else {
+                                idx = it->second;
+                            }
+                            indices.push_back(idx);
+                            if (!zm.has_min || s < zm.min_str) { zm.min_str = s; zm.has_min = true; }
+                            if (!zm.has_max || s > zm.max_str) { zm.max_str = s; zm.has_max = true; }
+                        }
+                        wp((uint32_t)dict.size());
+                        for (auto& entry : dict) {
+                            wp((uint32_t)entry.size());
+                            w(entry.data(), entry.size());
+                        }
+                        uint8_t bits = dict.size() <= 1 ? 1 : (uint8_t)std::bit_width((uint64_t)dict.size() - 1);
+                        wp(bits);
+                        std::vector<int64_t> idx64(indices.begin(), indices.end());
+                        std::vector<uint8_t> packed;
+                        pack_bits(idx64.data(), idx64.size(), 0, bits, packed);
+                        w(packed.data(), packed.size());
+                    } else {
+                        for (auto& v : col_data) {
+                            if (is_null(v)) continue;
+                            const auto& s = std::get<std::string>(v);
+                            wp((uint32_t)s.size());
+                            w(s.data(), s.size());
+                            if (!zm.has_min || s < zm.min_str) { zm.min_str = s; zm.has_min = true; }
+                            if (!zm.has_max || s > zm.max_str) { zm.max_str = s; zm.has_max = true; }
+                        }
+                    }
+                    break;
+                }
+                pg.comp_size = (uint32_t)page.size();
+                pg.crc = crc32c(page.data(), page.size());
+                pg.encoding = enc;
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+
     for (size_t ci = 0; ci < cols.size(); ci++) {
         pages[ci].offset = buf.size();
-        ZoneMap& zm = pages[ci].zm;
-        auto& col_data = cols[ci];
-        Encoding enc = meta[ci].encoding;
-        bool nullable = meta[ci].nullable;
-
-        if (nullable) {
-            auto validity = write_validity(col_data);
-            pages[ci].validity_size = (uint32_t)validity.size();
-            w(validity.data(), validity.size());
-        } else {
-            pages[ci].validity_size = 0;
-        }
-
-        switch (meta[ci].type) {
-        case ColumnType::I32:
-            if (enc == Encoding::BIT_PACKED) {
-                int32_t cmin = INT32_MAX, cmax = INT32_MIN;
-                for (auto& v : col_data) {
-                    if (is_null(v)) continue;
-                    int32_t val = std::get<int32_t>(v);
-                    if (val < cmin) cmin = val;
-                    if (val > cmax) cmax = val;
-                }
-                int64_t range = (int64_t)cmax - (int64_t)cmin;
-                uint8_t bits = range == 0 ? 1 : (uint8_t)(std::bit_width((uint64_t)range));
-                if (bits > 32) bits = 32;
-                wp(cmin);
-                wp(bits);
-                std::vector<int64_t> tmp;
-                tmp.reserve(col_data.size());
-                for (auto& v : col_data) {
-                    if (!is_null(v)) tmp.push_back(std::get<int32_t>(v));
-                }
-                pack_bits(tmp.data(), tmp.size(), cmin, bits, buf);
-                zm.has_min = true; zm.min_i64 = cmin;
-                zm.has_max = true; zm.max_i64 = cmax;
-            } else {
-                for (auto& v : col_data) {
-                    if (is_null(v)) continue;
-                    int32_t val = std::get<int32_t>(v);
-                    wp(val);
-                    if (!zm.has_min || val < zm.min_i64) { zm.min_i64 = val; zm.has_min = true; }
-                    if (!zm.has_max || val > zm.max_i64) { zm.max_i64 = val; zm.has_max = true; }
-                }
-            }
-            break;
-        case ColumnType::I64:
-            if (enc == Encoding::BIT_PACKED) {
-                int64_t cmin = INT64_MAX, cmax = INT64_MIN;
-                for (auto& v : col_data) {
-                    if (is_null(v)) continue;
-                    int64_t val = std::get<int64_t>(v);
-                    if (val < cmin) cmin = val;
-                    if (val > cmax) cmax = val;
-                }
-                uint64_t range = (uint64_t)(cmax - cmin);
-                uint8_t bits = range == 0 ? 1 : (uint8_t)(std::bit_width(range));
-                if (bits > 64) bits = 64;
-                wp(cmin);
-                wp(bits);
-                std::vector<int64_t> tmp;
-                tmp.reserve(col_data.size());
-                for (auto& v : col_data) {
-                    if (!is_null(v)) tmp.push_back(std::get<int64_t>(v));
-                }
-                pack_bits(tmp.data(), tmp.size(), cmin, bits, buf);
-                zm.has_min = true; zm.min_i64 = cmin;
-                zm.has_max = true; zm.max_i64 = cmax;
-            } else {
-                for (auto& v : col_data) {
-                    if (is_null(v)) continue;
-                    int64_t val = std::get<int64_t>(v);
-                    wp(val);
-                    if (!zm.has_min || val < zm.min_i64) { zm.min_i64 = val; zm.has_min = true; }
-                    if (!zm.has_max || val > zm.max_i64) { zm.max_i64 = val; zm.has_max = true; }
-                }
-            }
-            break;
-        case ColumnType::F32:
-            for (auto& v : col_data) {
-                if (is_null(v)) continue;
-                float val = std::get<float>(v);
-                wp(val);
-                if (!zm.has_min || val < zm.min_f64) { zm.min_f64 = val; zm.has_min = true; }
-                if (!zm.has_max || val > zm.max_f64) { zm.max_f64 = val; zm.has_max = true; }
-            }
-            break;
-        case ColumnType::F64:
-            for (auto& v : col_data) {
-                if (is_null(v)) continue;
-                double val = std::get<double>(v);
-                wp(val);
-                if (!zm.has_min || val < zm.min_f64) { zm.min_f64 = val; zm.has_min = true; }
-                if (!zm.has_max || val > zm.max_f64) { zm.max_f64 = val; zm.has_max = true; }
-            }
-            break;
-        case ColumnType::STRING:
-            if (enc == Encoding::DICT) {
-                std::vector<std::string> dict;
-                std::unordered_map<std::string, uint32_t> dict_map;
-                std::vector<uint32_t> indices;
-                indices.reserve(col_data.size());
-                for (auto& v : col_data) {
-                    if (is_null(v)) { indices.push_back(UINT32_MAX); continue; }
-                    const auto& s = std::get<std::string>(v);
-                    auto it = dict_map.find(s);
-                    uint32_t idx;
-                    if (it == dict_map.end()) {
-                        idx = (uint32_t)dict.size();
-                        dict_map[s] = idx;
-                        dict.push_back(s);
-                    } else {
-                        idx = it->second;
-                    }
-                    indices.push_back(idx);
-                    if (!zm.has_min || s < zm.min_str) { zm.min_str = s; zm.has_min = true; }
-                    if (!zm.has_max || s > zm.max_str) { zm.max_str = s; zm.has_max = true; }
-                }
-                wp((uint32_t)dict.size());
-                for (auto& entry : dict) {
-                    wp((uint32_t)entry.size());
-                    w(entry.data(), entry.size());
-                }
-                uint8_t bits = dict.size() <= 1 ? 1 : (uint8_t)std::bit_width((uint64_t)dict.size() - 1);
-                wp(bits);
-                std::vector<int64_t> idx64(indices.begin(), indices.end());
-                std::vector<uint8_t> packed;
-                pack_bits(idx64.data(), idx64.size(), 0, bits, packed);
-                w(packed.data(), packed.size());
-            } else {
-                for (auto& v : col_data) {
-                    if (is_null(v)) continue;
-                    const auto& s = std::get<std::string>(v);
-                    wp((uint32_t)s.size());
-                    w(s.data(), s.size());
-                    if (!zm.has_min || s < zm.min_str) { zm.min_str = s; zm.has_min = true; }
-                    if (!zm.has_max || s > zm.max_str) { zm.max_str = s; zm.has_max = true; }
-                }
-            }
-            break;
-        }
-        pages[ci].comp_size = (uint32_t)(buf.size() - pages[ci].offset);
-        pages[ci].crc = crc32c(buf.data() + pages[ci].offset, pages[ci].comp_size);
+        w(page_bufs[ci].data(), page_bufs[ci].size());
     }
 
     uint32_t dir_offset = (uint32_t)buf.size();
@@ -825,7 +1203,7 @@ void Writer::write_chunk(const std::vector<std::vector<Value>>& cols,
         wp(pg.comp_size);
         wp(pg.crc);
         wp((uint8_t)meta[ci].type);
-        wp((uint8_t)meta[ci].encoding);
+        wp((uint8_t)pg.encoding);
         wp((uint32_t)cols[ci].size());
         wp(pg.validity_size);
         wp((uint8_t)(pg.zm.has_min ? 1 : 0));
@@ -853,20 +1231,11 @@ void Writer::write_chunk(const std::vector<std::vector<Value>>& cols,
         write_le<uint32_t>(f, raw_size);
         f.write(reinterpret_cast<const char*>(interleaved.data()),
                 (std::streamsize)interleaved.size());
-    } else if (codec_ == Codec::LZ4) {
-        // LZ4 compress the chunk buffer
-        auto compressed = lz4_compress(buf.data(), buf.size());
-        uint32_t comp_size = (uint32_t)compressed.size();
-        f.write(reinterpret_cast<const char*>(buf.data()), 4); // MAGIC
-        write_le<uint32_t>(f, raw_size);
-        write_le<uint32_t>(f, comp_size);
-        f.write(reinterpret_cast<const char*>(compressed.data()),
-                (std::streamsize)compressed.size());
-    } else if (codec_ == Codec::ZSTD) {
-        // ZSTD compress the chunk buffer
-        auto compressed = zstd_compress(buf.data(), buf.size());
+    } else if (codec_ == Codec::LZ4 || codec_ == Codec::ZSTD) {
+        // VERSION 4 segmented compression (parallel frames)
+        auto compressed = segmented_compress(buf.data(), buf.size(), codec_);
         if (compressed.empty())
-            throw std::runtime_error("zepto: zstd compress failed");
+            throw std::runtime_error("zepto: compression failed");
         uint32_t comp_size = (uint32_t)compressed.size();
         f.write(reinterpret_cast<const char*>(buf.data()), 4); // MAGIC
         write_le<uint32_t>(f, raw_size);
@@ -905,8 +1274,9 @@ void Writer::write_chunk_cols(const std::vector<WriteColArray>& cols,
     };
     auto wp = [&](const auto& v) { w(&v, sizeof(v)); };
 
-    struct PageInfo { uint64_t offset; uint32_t comp_size, crc; ZoneMap zm; uint32_t validity_size; };
+    struct PageInfo { uint64_t offset; uint32_t comp_size, crc; ZoneMap zm; uint32_t validity_size; Encoding encoding; };
     std::vector<PageInfo> pages(cols.size());
+    std::vector<std::vector<uint8_t>> page_bufs(cols.size());
 
     wp(MAGIC);
     wp((uint16_t)idx);
@@ -915,179 +1285,187 @@ void Writer::write_chunk_cols(const std::vector<WriteColArray>& cols,
     size_t dir_off_pos = buf.size();
     wp((uint32_t)0);
 
+    // Encode each column page in parallel; every thread only touches its own
+    // page buffer and PageInfo, and reads the input arrays (shared, const).
+    std::atomic<size_t> next_col{0};
+    unsigned hw = std::thread::hardware_concurrency();
+    size_t nthreads = cols.empty() ? 1 : std::min(cols.size(), (size_t)(hw ? hw : 1));
+    std::vector<std::thread> threads;
+    threads.reserve(nthreads);
+    for (size_t t = 0; t < nthreads; t++) {
+        threads.emplace_back([&] {
+            for (;;) {
+                size_t ci = next_col.fetch_add(1);
+                if (ci >= cols.size()) break;
+
+                auto& page = page_bufs[ci];
+                auto& pg = pages[ci];
+                auto& ca = cols[ci];
+                ZoneMap& zm = pg.zm;
+                Encoding enc = meta[ci].encoding;
+                bool nullable = meta[ci].nullable;
+                size_t nrows = ca.num_values;
+
+                auto w = [&](const void* d, size_t n) {
+                    auto* p = static_cast<const uint8_t*>(d);
+                    page.insert(page.end(), p, p + n);
+                };
+                auto wp = [&](const auto& v) { w(&v, sizeof(v)); };
+
+                if (nullable && ca.validity) {
+                    size_t bmp_size = (nrows + 7) / 8;
+                    pg.validity_size = (uint32_t)bmp_size;
+                    w(ca.validity, bmp_size);
+                } else if (nullable) {
+                    size_t bmp_size = (nrows + 7) / 8;
+                    std::vector<uint8_t> all_valid(bmp_size, 0xFF);
+                    pg.validity_size = (uint32_t)bmp_size;
+                    w(all_valid.data(), bmp_size);
+                } else {
+                    pg.validity_size = 0;
+                }
+
+                auto get_valid = [&](size_t i) -> bool {
+                    if (!ca.validity) return true;
+                    return (ca.validity[i / 8] >> (i % 8)) & 1;
+                };
+
+                switch (meta[ci].type) {
+                case ColumnType::I32: {
+                    const int32_t* vals = reinterpret_cast<const int32_t*>(ca.data);
+                    std::vector<int64_t> tmp;
+                    tmp.reserve(nrows);
+                    int32_t cmin = INT32_MAX, cmax = INT32_MIN;
+                    for (size_t i = 0; i < nrows; i++) {
+                        if (!get_valid(i)) continue;
+                        int32_t val = vals[i];
+                        tmp.push_back(val);
+                        if (val < cmin) cmin = val;
+                        if (val > cmax) cmax = val;
+                    }
+                    uint64_t span = (uint64_t)cmax - (uint64_t)cmin;
+                    uint8_t range_bits = span == 0 ? 1 : (uint8_t)std::bit_width(span);
+
+                    std::vector<uint8_t> val_bytes;
+                    enc = encode_int_page(tmp.data(), tmp.size(), 4, range_bits, enc, val_bytes);
+                    w(val_bytes.data(), val_bytes.size());
+                    zm.has_min = true; zm.min_i64 = cmin;
+                    zm.has_max = true; zm.max_i64 = cmax;
+                    break;
+                }
+                case ColumnType::I64: {
+                    const int64_t* vals = reinterpret_cast<const int64_t*>(ca.data);
+                    std::vector<int64_t> tmp;
+                    tmp.reserve(nrows);
+                    int64_t cmin = INT64_MAX, cmax = INT64_MIN;
+                    for (size_t i = 0; i < nrows; i++) {
+                        if (!get_valid(i)) continue;
+                        int64_t val = vals[i];
+                        tmp.push_back(val);
+                        if (val < cmin) cmin = val;
+                        if (val > cmax) cmax = val;
+                    }
+                    uint64_t span = (uint64_t)cmax - (uint64_t)cmin;
+                    uint8_t range_bits = span == 0 ? 1 : (uint8_t)std::bit_width(span);
+
+                    std::vector<uint8_t> val_bytes;
+                    enc = encode_int_page(tmp.data(), tmp.size(), 8, range_bits, enc, val_bytes);
+                    w(val_bytes.data(), val_bytes.size());
+                    zm.has_min = true; zm.min_i64 = cmin;
+                    zm.has_max = true; zm.max_i64 = cmax;
+                    break;
+                }
+                case ColumnType::F32: {
+                    const float* vals = reinterpret_cast<const float*>(ca.data);
+                    for (size_t i = 0; i < nrows; i++) {
+                        if (!get_valid(i)) continue;
+                        float val = vals[i];
+                        wp(val);
+                        if (!zm.has_min || val < zm.min_f64) { zm.min_f64 = val; zm.has_min = true; }
+                        if (!zm.has_max || val > zm.max_f64) { zm.max_f64 = val; zm.has_max = true; }
+                    }
+                    break;
+                }
+                case ColumnType::F64: {
+                    const double* vals = reinterpret_cast<const double*>(ca.data);
+                    for (size_t i = 0; i < nrows; i++) {
+                        if (!get_valid(i)) continue;
+                        double val = vals[i];
+                        wp(val);
+                        if (!zm.has_min || val < zm.min_f64) { zm.min_f64 = val; zm.has_min = true; }
+                        if (!zm.has_max || val > zm.max_f64) { zm.max_f64 = val; zm.has_max = true; }
+                    }
+                    break;
+                }
+                case ColumnType::STRING: {
+                    if (enc == Encoding::DICT) {
+                        std::vector<std::string> dict;
+                        std::unordered_map<std::string, uint32_t> dict_map;
+                        std::vector<uint32_t> indices(nrows, UINT32_MAX);
+                        const uint8_t* sptr = ca.data;
+
+                        for (size_t i = 0; i < nrows; i++) {
+                            uint32_t slen;
+                            memcpy(&slen, sptr, 4); sptr += 4;
+                            if (get_valid(i)) {
+                                std::string s((const char*)sptr, slen);
+                                auto it = dict_map.find(s);
+                                uint32_t dict_idx;
+                                if (it == dict_map.end()) {
+                                    dict_idx = (uint32_t)dict.size();
+                                    dict_map[s] = dict_idx;
+                                    dict.push_back(std::move(s));
+                                } else {
+                                    dict_idx = it->second;
+                                }
+                                indices[i] = dict_idx;
+
+                                auto& zs = dict[dict_idx];
+                                if (!zm.has_min || zs < zm.min_str) { zm.min_str = zs; zm.has_min = true; }
+                                if (!zm.has_max || zs > zm.max_str) { zm.max_str = zs; zm.has_max = true; }
+                            }
+                            sptr += slen;
+                        }
+                        wp((uint32_t)dict.size());
+                        for (auto& entry : dict) {
+                            wp((uint32_t)entry.size());
+                            w(entry.data(), entry.size());
+                        }
+                        uint8_t bits = dict.size() <= 1 ? 1 : (uint8_t)std::bit_width((uint64_t)dict.size() - 1);
+                        wp(bits);
+                        std::vector<int64_t> idx64(indices.begin(), indices.end());
+                        std::vector<uint8_t> packed;
+                        pack_bits(idx64.data(), idx64.size(), 0, bits, packed);
+                        w(packed.data(), packed.size());
+                    } else {
+                        const uint8_t* sptr = ca.data;
+                        for (size_t i = 0; i < nrows; i++) {
+                            uint32_t slen;
+                            memcpy(&slen, sptr, 4); sptr += 4;
+                            if (get_valid(i)) {
+                                wp(slen);
+                                w(sptr, slen);
+                                std::string s((const char*)sptr, slen);
+                                if (!zm.has_min || s < zm.min_str) { zm.min_str = s; zm.has_min = true; }
+                                if (!zm.has_max || s > zm.max_str) { zm.max_str = s; zm.has_max = true; }
+                            }
+                            sptr += slen;
+                        }
+                    }
+                    break;
+                }
+                }
+                pg.comp_size = (uint32_t)page.size();
+                pg.crc = crc32c(page.data(), page.size());
+                pg.encoding = enc;
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+
     for (size_t ci = 0; ci < cols.size(); ci++) {
         pages[ci].offset = buf.size();
-        ZoneMap& zm = pages[ci].zm;
-        auto& ca = cols[ci];
-        Encoding enc = meta[ci].encoding;
-        bool nullable = meta[ci].nullable;
-        size_t nrows = ca.num_values;
-
-        if (nullable && ca.validity) {
-            size_t bmp_size = (nrows + 7) / 8;
-            pages[ci].validity_size = (uint32_t)bmp_size;
-            w(ca.validity, bmp_size);
-        } else if (nullable) {
-            size_t bmp_size = (nrows + 7) / 8;
-            std::vector<uint8_t> all_valid(bmp_size, 0xFF);
-            pages[ci].validity_size = (uint32_t)bmp_size;
-            w(all_valid.data(), bmp_size);
-        } else {
-            pages[ci].validity_size = 0;
-        }
-
-        auto get_valid = [&](size_t i) -> bool {
-            if (!ca.validity) return true;
-            return (ca.validity[i / 8] >> (i % 8)) & 1;
-        };
-
-        switch (meta[ci].type) {
-        case ColumnType::I32: {
-            const int32_t* vals = reinterpret_cast<const int32_t*>(ca.data);
-            if (enc == Encoding::BIT_PACKED) {
-                int32_t cmin = INT32_MAX, cmax = INT32_MIN;
-                for (size_t i = 0; i < nrows; i++) {
-                    if (!get_valid(i)) continue;
-                    if (vals[i] < cmin) cmin = vals[i];
-                    if (vals[i] > cmax) cmax = vals[i];
-                }
-                int64_t range = (int64_t)cmax - (int64_t)cmin;
-                uint8_t bits = range == 0 ? 1 : (uint8_t)(std::bit_width((uint64_t)range));
-                if (bits > 32) bits = 32;
-                wp(cmin);
-                wp(bits);
-                std::vector<int64_t> tmp;
-                tmp.reserve(nrows);
-                for (size_t i = 0; i < nrows; i++)
-                    if (get_valid(i)) tmp.push_back(vals[i]);
-                pack_bits(tmp.data(), tmp.size(), cmin, bits, buf);
-                zm.has_min = true; zm.min_i64 = cmin;
-                zm.has_max = true; zm.max_i64 = cmax;
-            } else {
-                for (size_t i = 0; i < nrows; i++) {
-                    if (!get_valid(i)) continue;
-                    int32_t val = vals[i];
-                    wp(val);
-                    if (!zm.has_min || val < zm.min_i64) { zm.min_i64 = val; zm.has_min = true; }
-                    if (!zm.has_max || val > zm.max_i64) { zm.max_i64 = val; zm.has_max = true; }
-                }
-            }
-            break;
-        }
-        case ColumnType::I64: {
-            const int64_t* vals = reinterpret_cast<const int64_t*>(ca.data);
-            if (enc == Encoding::BIT_PACKED) {
-                int64_t cmin = INT64_MAX, cmax = INT64_MIN;
-                for (size_t i = 0; i < nrows; i++) {
-                    if (!get_valid(i)) continue;
-                    if (vals[i] < cmin) cmin = vals[i];
-                    if (vals[i] > cmax) cmax = vals[i];
-                }
-                uint64_t range = (uint64_t)(cmax - cmin);
-                uint8_t bits = range == 0 ? 1 : (uint8_t)(std::bit_width(range));
-                if (bits > 64) bits = 64;
-                wp(cmin);
-                wp(bits);
-                std::vector<int64_t> tmp;
-                tmp.reserve(nrows);
-                for (size_t i = 0; i < nrows; i++)
-                    if (get_valid(i)) tmp.push_back(vals[i]);
-                pack_bits(tmp.data(), tmp.size(), cmin, bits, buf);
-                zm.has_min = true; zm.min_i64 = cmin;
-                zm.has_max = true; zm.max_i64 = cmax;
-            } else {
-                for (size_t i = 0; i < nrows; i++) {
-                    if (!get_valid(i)) continue;
-                    int64_t val = vals[i];
-                    wp(val);
-                    if (!zm.has_min || val < zm.min_i64) { zm.min_i64 = val; zm.has_min = true; }
-                    if (!zm.has_max || val > zm.max_i64) { zm.max_i64 = val; zm.has_max = true; }
-                }
-            }
-            break;
-        }
-        case ColumnType::F32: {
-            const float* vals = reinterpret_cast<const float*>(ca.data);
-            for (size_t i = 0; i < nrows; i++) {
-                if (!get_valid(i)) continue;
-                float val = vals[i];
-                wp(val);
-                if (!zm.has_min || val < zm.min_f64) { zm.min_f64 = val; zm.has_min = true; }
-                if (!zm.has_max || val > zm.max_f64) { zm.max_f64 = val; zm.has_max = true; }
-            }
-            break;
-        }
-        case ColumnType::F64: {
-            const double* vals = reinterpret_cast<const double*>(ca.data);
-            for (size_t i = 0; i < nrows; i++) {
-                if (!get_valid(i)) continue;
-                double val = vals[i];
-                wp(val);
-                if (!zm.has_min || val < zm.min_f64) { zm.min_f64 = val; zm.has_min = true; }
-                if (!zm.has_max || val > zm.max_f64) { zm.max_f64 = val; zm.has_max = true; }
-            }
-            break;
-        }
-        case ColumnType::STRING: {
-            if (enc == Encoding::DICT) {
-                std::vector<std::string> dict;
-                std::unordered_map<std::string, uint32_t> dict_map;
-                std::vector<uint32_t> indices(nrows, UINT32_MAX);
-                const uint8_t* sptr = ca.data;
-
-                for (size_t i = 0; i < nrows; i++) {
-                    uint32_t slen;
-                    memcpy(&slen, sptr, 4); sptr += 4;
-                    if (get_valid(i)) {
-                        std::string s((const char*)sptr, slen);
-                        auto it = dict_map.find(s);
-                        uint32_t dict_idx;
-                        if (it == dict_map.end()) {
-                            dict_idx = (uint32_t)dict.size();
-                            dict_map[s] = dict_idx;
-                            dict.push_back(std::move(s));
-                        } else {
-                            dict_idx = it->second;
-                        }
-                        indices[i] = dict_idx;
-
-                        auto& zs = dict[dict_idx];
-                        if (!zm.has_min || zs < zm.min_str) { zm.min_str = zs; zm.has_min = true; }
-                        if (!zm.has_max || zs > zm.max_str) { zm.max_str = zs; zm.has_max = true; }
-                    }
-                    sptr += slen;
-                }
-                wp((uint32_t)dict.size());
-                for (auto& entry : dict) {
-                    wp((uint32_t)entry.size());
-                    w(entry.data(), entry.size());
-                }
-                uint8_t bits = dict.size() <= 1 ? 1 : (uint8_t)std::bit_width((uint64_t)dict.size() - 1);
-                wp(bits);
-                std::vector<int64_t> idx64(indices.begin(), indices.end());
-                std::vector<uint8_t> packed;
-                pack_bits(idx64.data(), idx64.size(), 0, bits, packed);
-                w(packed.data(), packed.size());
-            } else {
-                const uint8_t* sptr = ca.data;
-                for (size_t i = 0; i < nrows; i++) {
-                    uint32_t slen;
-                    memcpy(&slen, sptr, 4); sptr += 4;
-                    if (get_valid(i)) {
-                        wp(slen);
-                        w(sptr, slen);
-                        std::string s((const char*)sptr, slen);
-                        if (!zm.has_min || s < zm.min_str) { zm.min_str = s; zm.has_min = true; }
-                        if (!zm.has_max || s > zm.max_str) { zm.max_str = s; zm.has_max = true; }
-                    }
-                    sptr += slen;
-                }
-            }
-            break;
-        }
-        }
-        pages[ci].comp_size = (uint32_t)(buf.size() - pages[ci].offset);
-        pages[ci].crc = crc32c(buf.data() + pages[ci].offset, pages[ci].comp_size);
+        w(page_bufs[ci].data(), page_bufs[ci].size());
     }
 
     uint32_t dir_offset = (uint32_t)buf.size();
@@ -1098,7 +1476,7 @@ void Writer::write_chunk_cols(const std::vector<WriteColArray>& cols,
         wp(pg.comp_size);
         wp(pg.crc);
         wp((uint8_t)meta[ci].type);
-        wp((uint8_t)meta[ci].encoding);
+        wp((uint8_t)pg.encoding);
         wp((uint32_t)cols[ci].num_values);
         wp(pg.validity_size);
         wp((uint8_t)(pg.zm.has_min ? 1 : 0));
@@ -1125,18 +1503,10 @@ void Writer::write_chunk_cols(const std::vector<WriteColArray>& cols,
         write_le<uint32_t>(f, raw_size);
         f.write(reinterpret_cast<const char*>(interleaved.data()),
                 (std::streamsize)interleaved.size());
-    } else if (codec_ == Codec::LZ4) {
-        auto compressed = lz4_compress(buf.data(), buf.size());
-        uint32_t comp_size = (uint32_t)compressed.size();
-        f.write(reinterpret_cast<const char*>(buf.data()), 4);
-        write_le<uint32_t>(f, raw_size);
-        write_le<uint32_t>(f, comp_size);
-        f.write(reinterpret_cast<const char*>(compressed.data()),
-                (std::streamsize)compressed.size());
-    } else if (codec_ == Codec::ZSTD) {
-        auto compressed = zstd_compress(buf.data(), buf.size());
+    } else if (codec_ == Codec::LZ4 || codec_ == Codec::ZSTD) {
+        auto compressed = segmented_compress(buf.data(), buf.size(), codec_);
         if (compressed.empty())
-            throw std::runtime_error("zepto: zstd compress failed");
+            throw std::runtime_error("zepto: compression failed");
         uint32_t comp_size = (uint32_t)compressed.size();
         f.write(reinterpret_cast<const char*>(buf.data()), 4);
         write_le<uint32_t>(f, raw_size);
@@ -1222,14 +1592,15 @@ bool Reader::read_header() {
     total_rows_ = read_le<uint64_t>(f);
     uint32_t num_chunks_hdr = read_le<uint32_t>(f);
     uint32_t meta_size = read_le<uint32_t>(f);
-    if (magic != MAGIC || (version != 2 && version != 3)) return false;
+    if (magic != MAGIC || version < 2 || version > 4) return false;
 
-    // VERSION 3 has an extra 4-byte flags field at offset 24
+    // VERSION 3/4 have an extra 4-byte flags field at offset 24
     // VERSION 2: RS-ECC was always on
     uint32_t file_flags = 0;
-    if (version == 3) {
+    if (version >= 3) {
         file_flags = read_le<uint32_t>(f);
     }
+    file_version_ = version;
     use_rs_ = (version == 2) ? true : ((file_flags & FLAG_RS_ECC) != 0);
     if (version == 2) {
         codec_ = Codec::NONE;
@@ -1328,12 +1699,17 @@ bool Reader::read_chunk_meta(ChunkMeta& meta) {
         if (!rs_decode_interleaved(raw.data(), raw_size, payload.data(), payload.size()))
             return false;
         raw.resize(raw_size);
-    } else if (codec_ == Codec::LZ4) {
-        raw = lz4_decompress(payload.data(), payload.size(), raw_size);
-        if (raw.size() != raw_size) return false;
-    } else if (codec_ == Codec::ZSTD) {
-        raw = zstd_decompress(payload.data(), payload.size(), raw_size);
-        if (raw.size() != raw_size) return false;
+    } else if (codec_ == Codec::LZ4 || codec_ == Codec::ZSTD) {
+        if (file_version_ >= 4) {
+            if (!segmented_decompress(payload.data(), payload.size(), raw_size, codec_, raw))
+                return false;
+        } else if (codec_ == Codec::LZ4) {
+            raw = lz4_decompress(payload.data(), payload.size(), raw_size);
+            if (raw.size() != raw_size) return false;
+        } else {
+            raw = zstd_decompress(payload.data(), payload.size(), raw_size);
+            if (raw.size() != raw_size) return false;
+        }
     } else {
         raw = std::move(payload);
         if (raw_size > comp_size) return false;
@@ -1438,12 +1814,19 @@ bool Reader::verify_integrity() {
             uint32_t comp_size = r32(pos + 8);
             size_t chunk_end = pos + 12 + comp_size;
             if (chunk_end > (size_t)size) { ok = false; break; }
-            if (codec_ == Codec::LZ4) {
-                raw = lz4_decompress(buf.data() + pos + 12, comp_size, raw_size);
-                if (raw.size() != raw_size) { ok = false; break; }
-            } else if (codec_ == Codec::ZSTD) {
-                raw = zstd_decompress(buf.data() + pos + 12, comp_size, raw_size);
-                if (raw.size() != raw_size) { ok = false; break; }
+            if (codec_ == Codec::LZ4 || codec_ == Codec::ZSTD) {
+                if (file_version_ >= 4) {
+                    if (!segmented_decompress(buf.data() + pos + 12, comp_size, raw_size,
+                                              codec_, raw)) {
+                        ok = false; break;
+                    }
+                } else if (codec_ == Codec::LZ4) {
+                    raw = lz4_decompress(buf.data() + pos + 12, comp_size, raw_size);
+                    if (raw.size() != raw_size) { ok = false; break; }
+                } else {
+                    raw = zstd_decompress(buf.data() + pos + 12, comp_size, raw_size);
+                    if (raw.size() != raw_size) { ok = false; break; }
+                }
             } else {
                 raw.assign(buf.data() + pos + 12, buf.data() + pos + 12 + raw_size);
             }
@@ -1494,12 +1877,16 @@ std::vector<uint8_t> Reader::read_and_decode_chunk(size_t chunk_idx) {
         std::vector<uint8_t> payload(comp_size);
         f.read(reinterpret_cast<char*>(payload.data()), (std::streamsize)comp_size);
         if (!f) return empty;
-        if (codec_ == Codec::LZ4) {
-            auto raw = lz4_decompress(payload.data(), payload.size(), raw_size);
-            if (raw.size() != raw_size) return empty;
-            return raw;
-        } else if (codec_ == Codec::ZSTD) {
-            auto raw = zstd_decompress(payload.data(), payload.size(), raw_size);
+        if (codec_ == Codec::LZ4 || codec_ == Codec::ZSTD) {
+            std::vector<uint8_t> raw;
+            if (file_version_ >= 4) {
+                if (!segmented_decompress(payload.data(), payload.size(), raw_size, codec_, raw))
+                    return empty;
+            } else if (codec_ == Codec::LZ4) {
+                raw = lz4_decompress(payload.data(), payload.size(), raw_size);
+            } else {
+                raw = zstd_decompress(payload.data(), payload.size(), raw_size);
+            }
             if (raw.size() != raw_size) return empty;
             return raw;
         } else {
@@ -1598,17 +1985,31 @@ std::vector<Row> Reader::read_chunk(size_t chunk_idx) {
 
         switch (e.type) {
         case ColumnType::I32:
-            if (e.encoding == Encoding::BIT_PACKED) {
-                int32_t min_val;
-                memcpy(&min_val, page_start + off, 4); off += 4;
-                uint8_t bits = page_start[off++];
+            if (e.encoding == Encoding::BIT_PACKED || e.encoding == Encoding::DELTA ||
+                e.encoding == Encoding::RLE) {
+                int32_t min_val = 0;
                 size_t non_null_count = 0;
                 for (size_t i = 0; i < meta.num_rows; i++) {
                     bool valid = validity.empty() || ((validity[i / 8] >> (i % 8)) & 1);
                     if (valid) non_null_count++;
                 }
-                std::vector<int64_t> tmp(non_null_count);
-                unpack_bits(tmp.data(), non_null_count, min_val, bits, page_start + off);
+                std::vector<int64_t> tmp;
+                if (e.encoding == Encoding::DELTA) {
+                    if (off >= e.comp_size) break;
+                    if (!delta_decode(page_start + off, e.comp_size - off, 4,
+                                      non_null_count, tmp))
+                        break;
+                } else if (e.encoding == Encoding::RLE) {
+                    if (off >= e.comp_size) break;
+                    if (!rle_decode(page_start + off, e.comp_size - off, 4,
+                                    non_null_count, tmp))
+                        break;
+                } else {
+                    memcpy(&min_val, page_start + off, 4); off += 4;
+                    uint8_t bits = page_start[off++];
+                    tmp.resize(non_null_count);
+                    unpack_bits(tmp.data(), non_null_count, min_val, bits, page_start + off);
+                }
                 size_t vi = 0;
                 for (size_t i = 0; i < meta.num_rows; i++) {
                     bool valid = validity.empty() || ((validity[i / 8] >> (i % 8)) & 1);
@@ -1632,17 +2033,31 @@ std::vector<Row> Reader::read_chunk(size_t chunk_idx) {
             }
             break;
         case ColumnType::I64:
-            if (e.encoding == Encoding::BIT_PACKED) {
-                int64_t min_val;
-                memcpy(&min_val, page_start + off, 8); off += 8;
-                uint8_t bits = page_start[off++];
+            if (e.encoding == Encoding::BIT_PACKED || e.encoding == Encoding::DELTA ||
+                e.encoding == Encoding::RLE) {
+                int64_t min_val = 0;
                 size_t non_null_count = 0;
                 for (size_t i = 0; i < meta.num_rows; i++) {
                     bool valid = validity.empty() || ((validity[i / 8] >> (i % 8)) & 1);
                     if (valid) non_null_count++;
                 }
-                std::vector<int64_t> tmp(non_null_count);
-                unpack_bits(tmp.data(), non_null_count, min_val, bits, page_start + off);
+                std::vector<int64_t> tmp;
+                if (e.encoding == Encoding::DELTA) {
+                    if (off >= e.comp_size) break;
+                    if (!delta_decode(page_start + off, e.comp_size - off, 8,
+                                      non_null_count, tmp))
+                        break;
+                } else if (e.encoding == Encoding::RLE) {
+                    if (off >= e.comp_size) break;
+                    if (!rle_decode(page_start + off, e.comp_size - off, 8,
+                                    non_null_count, tmp))
+                        break;
+                } else {
+                    memcpy(&min_val, page_start + off, 8); off += 8;
+                    uint8_t bits = page_start[off++];
+                    tmp.resize(non_null_count);
+                    unpack_bits(tmp.data(), non_null_count, min_val, bits, page_start + off);
+                }
                 size_t vi = 0;
                 for (size_t i = 0; i < meta.num_rows; i++) {
                     bool valid = validity.empty() || ((validity[i / 8] >> (i % 8)) & 1);
@@ -1828,15 +2243,29 @@ std::vector<Reader::ColumnArray> Reader::read_chunk_cols(
         case ColumnType::I32: {
             ca.data.resize(meta.num_rows * sizeof(int32_t));
             auto* dst = reinterpret_cast<int32_t*>(ca.data.data());
-            if (e.encoding == Encoding::BIT_PACKED) {
-                int32_t min_val;
-                memcpy(&min_val, page_start + off, 4); off += 4;
-                uint8_t bits = page_start[off++];
+            if (e.encoding == Encoding::BIT_PACKED || e.encoding == Encoding::DELTA ||
+                e.encoding == Encoding::RLE) {
                 size_t non_null_count = 0;
                 for (size_t i = 0; i < meta.num_rows; i++)
                     if (get_valid(i)) non_null_count++;
-                std::vector<int64_t> tmp(non_null_count);
-                unpack_bits(tmp.data(), non_null_count, min_val, bits, page_start + off);
+                std::vector<int64_t> tmp;
+                if (e.encoding == Encoding::DELTA) {
+                    if (off >= e.comp_size) break;
+                    if (!delta_decode(page_start + off, e.comp_size - off, 4,
+                                      non_null_count, tmp))
+                        break;
+                } else if (e.encoding == Encoding::RLE) {
+                    if (off >= e.comp_size) break;
+                    if (!rle_decode(page_start + off, e.comp_size - off, 4,
+                                    non_null_count, tmp))
+                        break;
+                } else {
+                    int32_t min_val;
+                    memcpy(&min_val, page_start + off, 4); off += 4;
+                    uint8_t bits = page_start[off++];
+                    tmp.resize(non_null_count);
+                    unpack_bits(tmp.data(), non_null_count, min_val, bits, page_start + off);
+                }
                 size_t vi = 0;
                 for (size_t i = 0; i < meta.num_rows; i++)
                     dst[i] = get_valid(i) ? (int32_t)tmp[vi++] : 0;
@@ -1854,15 +2283,29 @@ std::vector<Reader::ColumnArray> Reader::read_chunk_cols(
         case ColumnType::I64: {
             ca.data.resize(meta.num_rows * sizeof(int64_t));
             auto* dst = reinterpret_cast<int64_t*>(ca.data.data());
-            if (e.encoding == Encoding::BIT_PACKED) {
-                int64_t min_val;
-                memcpy(&min_val, page_start + off, 8); off += 8;
-                uint8_t bits = page_start[off++];
+            if (e.encoding == Encoding::BIT_PACKED || e.encoding == Encoding::DELTA ||
+                e.encoding == Encoding::RLE) {
                 size_t non_null_count = 0;
                 for (size_t i = 0; i < meta.num_rows; i++)
                     if (get_valid(i)) non_null_count++;
-                std::vector<int64_t> tmp(non_null_count);
-                unpack_bits(tmp.data(), non_null_count, min_val, bits, page_start + off);
+                std::vector<int64_t> tmp;
+                if (e.encoding == Encoding::DELTA) {
+                    if (off >= e.comp_size) break;
+                    if (!delta_decode(page_start + off, e.comp_size - off, 8,
+                                      non_null_count, tmp))
+                        break;
+                } else if (e.encoding == Encoding::RLE) {
+                    if (off >= e.comp_size) break;
+                    if (!rle_decode(page_start + off, e.comp_size - off, 8,
+                                    non_null_count, tmp))
+                        break;
+                } else {
+                    int64_t min_val;
+                    memcpy(&min_val, page_start + off, 8); off += 8;
+                    uint8_t bits = page_start[off++];
+                    tmp.resize(non_null_count);
+                    unpack_bits(tmp.data(), non_null_count, min_val, bits, page_start + off);
+                }
                 size_t vi = 0;
                 for (size_t i = 0; i < meta.num_rows; i++)
                     dst[i] = get_valid(i) ? tmp[vi++] : 0;
@@ -2864,6 +3307,8 @@ bool Database::exec(const std::string& sql) {
                 if (!cm.nullable) std::cout << " NOT NULL";
                 if (cm.encoding == Encoding::DICT) std::cout << " DICT";
                 else if (cm.encoding == Encoding::BIT_PACKED) std::cout << " BIT_PACKED";
+                else if (cm.encoding == Encoding::DELTA) std::cout << " DELTA";
+                else if (cm.encoding == Encoding::RLE) std::cout << " RLE";
                 std::cout << (i + 1 < schema_.size() ? "," : "") << "\n";
             }
             std::cout << "  )\n";
@@ -2911,6 +3356,10 @@ void Database::exec_create(const std::vector<std::string>& tok, size_t& pos) {
                 enc = Encoding::DICT; pos++;
             } else if (kw == "BIT_PACKED") {
                 enc = Encoding::BIT_PACKED; pos++;
+            } else if (kw == "DELTA") {
+                enc = Encoding::DELTA; pos++;
+            } else if (kw == "RLE") {
+                enc = Encoding::RLE; pos++;
             } else if (kw == "PLAIN") {
                 enc = Encoding::PLAIN; pos++;
             } else break;
@@ -3567,6 +4016,8 @@ void Database::exec_alter(const std::vector<std::string>& tok, size_t& pos) {
             else if (kw == "NULL" || kw == "NULLABLE") { nullable = true; pos++; }
             else if (kw == "DICT") { enc = Encoding::DICT; pos++; }
             else if (kw == "BIT_PACKED") { enc = Encoding::BIT_PACKED; pos++; }
+            else if (kw == "DELTA") { enc = Encoding::DELTA; pos++; }
+            else if (kw == "RLE") { enc = Encoding::RLE; pos++; }
             else if (kw == "PLAIN") { enc = Encoding::PLAIN; pos++; }
             else break;
         }

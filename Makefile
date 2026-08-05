@@ -5,7 +5,7 @@ CAPI_SRC  = zepto_capi.cpp
 
 ZSTD_INC  = third_party/zstd
 
-TEST_SRCS = quick_test corrupt_test rs_test lz4_test
+TEST_SRCS = quick_test corrupt_test rs_test lz4_test delta_test
 TOOL_SRCS = zcli
 ALL_EXES  = zepto $(TEST_SRCS) $(TOOL_SRCS)
 
@@ -64,6 +64,7 @@ test: $(addsuffix $(EXE_EXT),$(TEST_SRCS))
 	@$(word 2,$(TEST_SRCS))$(EXE_EXT)
 	@$(word 3,$(TEST_SRCS))$(EXE_EXT)
 	@$(word 4,$(TEST_SRCS))$(EXE_EXT)
+	@$(word 5,$(TEST_SRCS))$(EXE_EXT)
 	@echo "  All tests passed."
 
 tools: $(addsuffix $(EXE_EXT),$(TOOL_SRCS))
@@ -90,6 +91,9 @@ rs_test$(EXE_EXT): rs_test.cpp $(SRC) zepto.h
 
 lz4_test$(EXE_EXT): lz4_test.cpp $(SRC) zepto.h
 	$(CXX) $(CXXFLAGS) -o $@ lz4_test.cpp $(SRC) $(ZSTD_LIB)
+
+delta_test$(EXE_EXT): delta_test.cpp $(SRC) zepto.h
+	$(CXX) $(CXXFLAGS) -o $@ delta_test.cpp $(SRC) $(ZSTD_LIB)
 
 # ---- Tool executables ----
 zcli$(EXE_EXT): zcli.cpp $(SRC) zepto.h

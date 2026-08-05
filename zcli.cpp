@@ -127,7 +127,7 @@ static void print_help() {
     .help                 Show this help
 
   SQL:
-    CREATE TABLE <name> (<col> <type> [NOT NULL] [DICT|BIT_PACKED], ...)
+    CREATE TABLE <name> (<col> <type> [NOT NULL] [DICT|BIT_PACKED|DELTA|RLE], ...)
     INSERT INTO <name> VALUES (<val>, ...)
     SELECT [*|<cols>|<agg>(<col>)] FROM <name>
       [WHERE <cond>] [GROUP BY <col>] [ORDER BY <col> [ASC|DESC]]
