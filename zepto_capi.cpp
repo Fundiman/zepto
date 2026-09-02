@@ -19,7 +19,7 @@ int zepto_version(void) {
 }
 
 const char* zepto_version_string(void) {
-    return "1.0.0";
+    return "1.1.0";
 }
 
 // ---- Error messages ----
@@ -246,6 +246,69 @@ const char* zepto_db_query_value(zepto_db* db, int row_index, int col_index) {
     auto& row = rows[row_index];
     if (col_index < 0 || col_index >= (int)row.size()) return "";
     return row[col_index].c_str();
+}
+
+// ---- Streaming query results ----
+
+struct zepto_stream {
+    zepto::StreamedQuery q;
+};
+
+zepto_stream* zepto_db_stream_open(zepto_db* db, const char* sql) {
+    if (!db || !sql) return nullptr;
+    zepto_stream* s = nullptr;
+    try {
+        s = new zepto_stream();
+        s->q.start(db->db, sql);
+    } catch (...) {
+        delete s;
+        return nullptr;
+    }
+    return s;
+}
+
+void zepto_db_stream_close(zepto_stream* s) {
+    delete s;
+}
+
+int zepto_db_stream_next(zepto_stream* s) {
+    if (!s) return -1;
+    if (!s->q.error().empty()) return -1;
+    try {
+        return s->q.next() ? 1 : 0;
+    } catch (...) { return -1; }
+}
+
+const char* zepto_db_stream_error(zepto_stream* s) {
+    if (!s) return "";
+    return s->q.error().c_str();
+}
+
+int zepto_db_stream_col_count(zepto_stream* s) {
+    if (!s) return 0;
+    return s->q.col_count();
+}
+
+int zepto_db_stream_col_type(zepto_stream* s, int col_index) {
+    if (!s || col_index < 0 || col_index >= s->q.col_count()) return -1;
+    return (int)s->q.col_type(col_index);
+}
+
+const char* zepto_db_stream_col_name(zepto_stream* s, int col_index) {
+    if (!s || col_index < 0 || col_index >= s->q.col_count()) return "";
+    return s->q.col_name(col_index).c_str();
+}
+
+const char* zepto_db_stream_value(zepto_stream* s, int col_index) {
+    if (!s) return "";
+    auto& row = s->q.row();
+    if (col_index < 0 || col_index >= (int)row.size()) return "";
+    return row[col_index].c_str();
+}
+
+int zepto_db_stream_row_count(zepto_stream* s) {
+    if (!s) return 0;
+    return s->q.row_count();
 }
 
 // ---- Columnar API ----

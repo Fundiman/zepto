@@ -10,6 +10,13 @@
 *.dylib
 *.exp
 
+# --- Python / build artifacts ---
+*.egg-info/
+dist/
+.eggs/
+*.pyc
+*.pyo
+
 # --- Build directories ---
 build/
 cmake-build-*/

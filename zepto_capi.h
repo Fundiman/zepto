@@ -15,7 +15,7 @@ extern "C" {
 // ---- Version ----
 
 #define ZEPTO_VERSION_MAJOR 1
-#define ZEPTO_VERSION_MINOR 0
+#define ZEPTO_VERSION_MINOR 1
 #define ZEPTO_VERSION_PATCH 0
 
 ZEPTO_API int zepto_version(void);
@@ -65,6 +65,9 @@ ZEPTO_API void zepto_read_free(zepto_read_result* res);
 
 typedef struct zepto_db zepto_db;
 
+// dir may be a database directory (data.zdb + wal + snapshots/) or a
+// .zdb checkpoint file. A .zdb path names the checkpoint file directly:
+// WAL at <name>/wal/wal, checkpoint at <name>/data/<name>.zdb.
 ZEPTO_API zepto_db* zepto_db_open(const char* dir);
 ZEPTO_API void      zepto_db_close(zepto_db* db);
 ZEPTO_API int       zepto_db_exec(zepto_db* db, const char* sql);
@@ -80,6 +83,22 @@ ZEPTO_API int zepto_db_query_row_count(zepto_db* db);
 ZEPTO_API const char* zepto_db_query_col_name(zepto_db* db, int col_index);
 ZEPTO_API int zepto_db_query_col_type(zepto_db* db, int col_index);
 ZEPTO_API const char* zepto_db_query_value(zepto_db* db, int row_index, int col_index);
+
+// ---- Streaming query results ----
+// Streams SELECT rows as they are found while the scan is still running.
+// All columns are reported as STRING values (same as the buffered query API).
+
+typedef struct zepto_stream zepto_stream;
+
+ZEPTO_API zepto_stream* zepto_db_stream_open(zepto_db* db, const char* sql);
+ZEPTO_API void zepto_db_stream_close(zepto_stream* s);   // stop the worker; blocks until the scan finishes
+ZEPTO_API int zepto_db_stream_next(zepto_stream* s);   // 1 = row ready, 0 = exhausted, -1 = error
+ZEPTO_API const char* zepto_db_stream_error(zepto_stream* s);
+ZEPTO_API int zepto_db_stream_col_count(zepto_stream* s);
+ZEPTO_API int zepto_db_stream_col_type(zepto_stream* s, int col_index);
+ZEPTO_API const char* zepto_db_stream_col_name(zepto_stream* s, int col_index);
+ZEPTO_API const char* zepto_db_stream_value(zepto_stream* s, int col_index);
+ZEPTO_API int zepto_db_stream_row_count(zepto_stream* s);
 
 // ---- Columnar file API ----
 

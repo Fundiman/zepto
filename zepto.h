@@ -8,6 +8,11 @@
 #include <span>
 #include <memory>
 #include <fstream>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <deque>
+#include <atomic>
 
 namespace zepto {
 
@@ -255,9 +260,17 @@ public:
     Database() = default;
     ~Database();
 
+    // dir may be a database directory (data.zdb + wal + snapshots/) or a
+    // .zdb checkpoint file. A .zdb path names the checkpoint file directly:
+    // WAL at <name>/wal/wal, checkpoint at <name>/data/<name>.zdb.
     bool open(const std::string& dir);
     void close();
     bool exec(const std::string& sql);
+
+    // Runs a SELECT, printing its output to std::cout line by line as the
+    // scan finds matches. Used internally by StreamedQuery (which redirects
+    // std::cout to a sink while running this on a worker thread).
+    void stream_select(const std::string& sql);
 
     bool create_snapshot(const std::string& name);
     bool restore_snapshot(const std::string& name);
@@ -343,6 +356,81 @@ private:
     std::vector<ColumnType> query_col_types_;
     std::vector<std::vector<std::string>> query_rows_;
     std::ofstream wal_stream_;
+};
+
+// --- Streaming SELECT ---
+// Runs a SELECT on a worker thread and delivers each matched row as the scan
+// finds it, instead of waiting for the whole result set. Row values are
+// strings, matching the buffered exec() results. Aggregate / GROUP BY /
+// DISTINCT / ORDER BY queries necessarily buffer until the scan completes
+// before producing any row, but a plain SELECT streams rows immediately.
+class StreamedQuery {
+public:
+    StreamedQuery() = default;
+    ~StreamedQuery();
+    StreamedQuery(const StreamedQuery&) = delete;
+    StreamedQuery& operator=(const StreamedQuery&) = delete;
+
+    // Spawn the query worker and block until the result header is available
+    // (or the query fails before scanning). Returns false and sets error()
+    // on query-level failure (e.g. "no table", syntax error).
+    bool start(Database& db, const std::string& sql);
+
+    // Block until the next row is produced. Returns true when row() holds a
+    // new row; false when the stream is exhausted.
+    bool next();
+
+    // True once the stream is exhausted.
+    bool done() const { return impl_ && impl_->exhausted; }
+
+    // Non-empty on query-level failure.
+    const std::string& error() const;
+
+    // Result schema. All columns are reported as STRING (same as exec()).
+    int col_count() const;
+    const std::string& col_name(int index) const;
+    ColumnType col_type(int index) const;
+
+    // Most recently produced row; valid after next() returns true.
+    const std::vector<std::string>& row() const;
+
+    // Number of rows yielded so far.
+    int row_count() const;
+
+private:
+    struct Impl {
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::deque<std::string> lines;
+        bool finished = false;
+        bool header_ok = false;
+        bool exhausted = false;
+        std::string error;
+        std::vector<std::string> col_names;
+        std::vector<std::string> current_row;
+        int rows_yielded = 0;
+        std::atomic<bool> cancel{false};
+        std::thread worker;
+
+        void push_line(const std::string& line) {
+            if (cancel.load(std::memory_order_relaxed)) return;
+            std::lock_guard<std::mutex> lock(mtx);
+            lines.push_back(line);
+            cv.notify_one();
+        }
+        void finish() {
+            std::lock_guard<std::mutex> lock(mtx);
+            finished = true;
+            cv.notify_all();
+        }
+    };
+
+    class SinkBuf; // std::streambuf adapter, defined in zepto.cpp
+
+    std::shared_ptr<Impl> impl_;
+    static void worker_run(std::shared_ptr<Impl> impl, Database* db, std::string sql);
+    bool consume_header();
+    static std::vector<std::string> split_cell_line(const std::string& line);
 };
 
 } // namespace zepto

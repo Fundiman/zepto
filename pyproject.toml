@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zepto"
+version = "1.0.0"
+description = "Columnar-optimized storage engine with Reed-Solomon ECC (ctypes bindings)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Fundiman/zepto"
+
+[tool.setuptools]
+packages = ["zepto"]
+
+[tool.setuptools.package-data]
+zepto = ["*.pyi", "py.typed"]

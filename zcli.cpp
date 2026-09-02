@@ -328,7 +328,13 @@ static bool is_directory_db(const std::string& path) {
     return fs::exists(path) && fs::is_directory(path);
 }
 
+static bool ends_with(const std::string& s, const std::string& suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 static std::string ensure_db_dir(const std::string& path) {
+    if (ends_with(path, ".zdb")) return path; // a .zdb checkpoint file, not a directory
     if (is_directory_db(path)) return path;
     if (!fs::exists(path)) {
         fs::create_directories(path);

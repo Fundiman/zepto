@@ -18,6 +18,10 @@ namespace fs = std::filesystem;
 
 namespace zepto {
 
+// Serializes std::cout redirection for streaming SELECTs (see exec() and
+// StreamedQuery::worker_run).
+static std::mutex g_select_stream_mutex;
+
 // CRC32C with hardware support (SSE 4.2) or fallback table
 static uint32_t table[256];
 static bool table_init = false;
@@ -2600,13 +2604,31 @@ static Row bytes_to_row(const uint8_t* data, size_t len) {
 Database::~Database() { close(); }
 
 bool Database::open(const std::string& dir) {
-    dir_ = dir;
-    wal_path_ = dir_ + "/wal";
-    current_path_ = dir_ + "/data.zdb";
-    snap_dir_ = dir_ + "/snapshots";
+    // A path ending in ".zdb" names the checkpoint FILE directly (no
+    // directory required): supporting files live in a directory named after
+    // the file — WAL at <name>/wal/wal and the checkpoint at
+    // <name>/data/<name>.zdb. If the pointed-at .zdb already exists as a file,
+    // it is used as the checkpoint directly.
+    bool is_file = dir.size() >= 4 && dir.compare(dir.size() - 4, 4, ".zdb") == 0;
+    if (is_file) {
+        fs::path p(dir);
+        dir_ = dir.substr(0, dir.size() - 4);        // "dbname" (without .zdb)
+        wal_path_ = dir_ + "/wal/wal";
+        current_path_ = dir_ + "/data/" + p.filename().string();
+        snap_dir_ = dir_ + "/snapshots";
+        if (!fs::exists(current_path_) && fs::is_regular_file(dir))
+            current_path_ = dir;
+    } else {
+        dir_ = dir;
+        wal_path_ = dir_ + "/wal";
+        current_path_ = dir_ + "/data.zdb";
+        snap_dir_ = dir_ + "/snapshots";
+    }
 
     std::error_code ec;
     fs::create_directories(dir_, ec);
+    fs::create_directories(fs::path(wal_path_).parent_path(), ec);
+    fs::create_directories(fs::path(current_path_).parent_path(), ec);
     fs::create_directories(snap_dir_, ec);
 
     wal_stream_.open(wal_path_, std::ios::binary | std::ios::app);
@@ -3163,7 +3185,22 @@ bool Database::eval_where(const Row& row, const WhereClause& wc) const {
     return false;
 }
 
+void Database::stream_select(const std::string& sql) {
+    if (!opened_) { std::cout << "  database is not open\n"; return; }
+    auto tok = tokenize(sql);
+    if (tok.empty()) return;
+    if (to_upper(tok[0]) != "SELECT") {
+        std::cout << "  only SELECT statements support streaming\n";
+        return;
+    }
+    size_t p = 1;
+    exec_select(tok, p);
+}
+
 bool Database::exec(const std::string& sql) {
+    // Streaming SELECTs redirect std::cout on a worker thread, so serialize
+    // every exec() against that redirection (and against concurrent execs).
+    std::lock_guard<std::mutex> lock(g_select_stream_mutex);
     if (!opened_) return false;
     auto tok = tokenize(sql);
     if (tok.empty()) return true;
@@ -3898,6 +3935,158 @@ void Database::exec_select(const std::vector<std::string>& tok, size_t& pos) {
         count++;
     }
     std::cout << "  (" << count << " row(s))\n";
+}
+
+// ---------------------------------------------------------------------------
+// StreamedQuery — streaming SELECT
+// ---------------------------------------------------------------------------
+
+StreamedQuery::~StreamedQuery() {
+    if (!impl_) return;
+    impl_->cancel.store(true, std::memory_order_relaxed);
+    if (impl_->worker.joinable()) impl_->worker.join();
+}
+
+bool StreamedQuery::start(Database& db, const std::string& sql) {
+    impl_ = std::make_shared<Impl>();
+    impl_->worker = std::thread(worker_run, impl_, &db, sql);
+    return consume_header();
+}
+
+// std::streambuf that splits the redirected std::cout output into complete
+// lines and feeds them to the StreamedQuery sink.
+class StreamedQuery::SinkBuf : public std::streambuf {
+public:
+    explicit SinkBuf(const std::shared_ptr<StreamedQuery::Impl>& sink) : sink_(sink) {}
+protected:
+    int_type overflow(int_type c) override {
+        if (c == traits_type::eof()) return traits_type::not_eof(c);
+        if (c == '\n') { sink_->push_line(buf_); buf_.clear(); }
+        else buf_ += (char)c;
+        return c;
+    }
+    std::streamsize xsputn(const char* s, std::streamsize n) override {
+        for (std::streamsize i = 0; i < n; i++) {
+            if (s[i] == '\n') { sink_->push_line(buf_); buf_.clear(); }
+            else buf_ += s[i];
+        }
+        return n;
+    }
+public:
+    void flush_partial() {
+        if (!buf_.empty()) { sink_->push_line(buf_); buf_.clear(); }
+    }
+private:
+    std::shared_ptr<StreamedQuery::Impl> sink_;
+    std::string buf_;
+};
+
+void StreamedQuery::worker_run(std::shared_ptr<Impl> impl, Database* db, std::string sql) {
+    {
+        std::lock_guard<std::mutex> lock(g_select_stream_mutex);
+        SinkBuf sink(impl);
+        auto* old = std::cout.rdbuf(&sink);
+        try {
+            if (!db) throw std::runtime_error("streaming SELECT: database handle is null");
+            db->stream_select(sql);
+        } catch (const std::exception& e) {
+            std::lock_guard<std::mutex> l(impl->mtx);
+            impl->error = e.what();
+        } catch (...) {
+            std::lock_guard<std::mutex> l(impl->mtx);
+            impl->error = "unknown error during streaming SELECT";
+        }
+        std::cout.rdbuf(old);
+        sink.flush_partial();
+    }
+    impl->finish();
+}
+
+bool StreamedQuery::consume_header() {
+    std::unique_lock<std::mutex> lock(impl_->mtx);
+    impl_->cv.wait(lock, [&] { return impl_->finished || !impl_->lines.empty(); });
+    if (impl_->lines.empty()) {
+        // Finished with no output at all.
+        impl_->exhausted = true;
+        if (impl_->error.empty()) impl_->error = "no output from SELECT";
+        return false;
+    }
+    std::string header = std::move(impl_->lines.front());
+    impl_->lines.pop_front();
+    // Error/status lines are printed with two leading spaces.
+    if (header.size() >= 2 && header[0] == ' ' && header[1] == ' ') {
+        impl_->error = header;
+        impl_->exhausted = true;
+        return false;
+    }
+    impl_->col_names = split_cell_line(header);
+    // Separator line follows the header.
+    impl_->cv.wait(lock, [&] { return impl_->finished || !impl_->lines.empty(); });
+    if (!impl_->lines.empty()) impl_->lines.pop_front();
+    impl_->header_ok = true;
+    return true;
+}
+
+std::vector<std::string> StreamedQuery::split_cell_line(const std::string& line) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (true) {
+        size_t end = line.find('|', start);
+        if (end == std::string::npos) end = line.size();
+        std::string cell = line.substr(start, end - start);
+        size_t b = cell.find_first_not_of(" \t");
+        size_t e = cell.find_last_not_of(" \t");
+        out.push_back((b == std::string::npos) ? "" : cell.substr(b, e - b + 1));
+        if (end == line.size()) break;
+        start = end + 1;
+    }
+    return out;
+}
+
+bool StreamedQuery::next() {
+    if (!impl_ || !impl_->header_ok) return false;
+    std::unique_lock<std::mutex> lock(impl_->mtx);
+    while (!impl_->finished && impl_->lines.empty())
+        impl_->cv.wait(lock);
+    while (!impl_->lines.empty()) {
+        std::string line = std::move(impl_->lines.front());
+        impl_->lines.pop_front();
+        if (line.find("row(s))") != std::string::npos) { impl_->exhausted = true; return false; }
+        if (line.empty()) continue;
+        impl_->current_row = split_cell_line(line);
+        impl_->rows_yielded++;
+        return true;
+    }
+    impl_->exhausted = true;
+    return false;
+}
+
+const std::string& StreamedQuery::error() const {
+    static const std::string kEmpty;
+    return impl_ ? impl_->error : kEmpty;
+}
+
+int StreamedQuery::col_count() const {
+    return impl_ ? (int)impl_->col_names.size() : 0;
+}
+
+const std::string& StreamedQuery::col_name(int index) const {
+    static const std::string kEmpty;
+    if (!impl_ || index < 0 || index >= (int)impl_->col_names.size()) return kEmpty;
+    return impl_->col_names[index];
+}
+
+ColumnType StreamedQuery::col_type(int index) const {
+    return ColumnType::STRING;
+}
+
+const std::vector<std::string>& StreamedQuery::row() const {
+    static const std::vector<std::string> kEmpty;
+    return impl_ ? impl_->current_row : kEmpty;
+}
+
+int StreamedQuery::row_count() const {
+    return impl_ ? impl_->rows_yielded : 0;
 }
 
 void Database::exec_update(const std::vector<std::string>& tok, size_t& pos) {
